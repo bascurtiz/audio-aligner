@@ -48,6 +48,7 @@ from warp_align_fail_all import (
     FAIL_ALL,
     SR_ANALYSIS,
     WarpResult,
+    _pad_text,
     bandpass,
     chroma_xcorr_pad,
     find_backup_stems,
@@ -958,6 +959,8 @@ def _scored_edit_row(folder: Path, notes: list[str], on_step) -> dict:
         aca_lag,
         inst_lag,
         stem_notes,
+        aca_points,
+        inst_points,
     ) = stem_verdicts(
         aca,
         inst,
@@ -980,6 +983,8 @@ def _scored_edit_row(folder: Path, notes: list[str], on_step) -> dict:
         "drift_ms": drift,
         "aca_lag_sec": aca_lag,
         "inst_lag_sec": inst_lag,
+        "aca_checkpoints": aca_points,
+        "inst_checkpoints": inst_points,
         "notes": "; ".join(notes),
     }
 
@@ -1453,7 +1458,7 @@ def main() -> int:
         moved = f" -> {Path(r.moved_to).name}" if r.moved_to else ""
         print(
             f"[{r.verdict.upper()}] {r.folder} corr={r.corr:.3f} drift={r.drift_ms:.1f}ms "
-            f"pads=({r.aca_pad_sec:+.3f},{r.inst_pad_sec:+.3f}) ({i}/{len(folders)}){moved}",
+            f"pads=({_pad_text(r.aca_pad_sec)},{_pad_text(r.inst_pad_sec)}) ({i}/{len(folders)}){moved}",
             flush=True,
         )
 

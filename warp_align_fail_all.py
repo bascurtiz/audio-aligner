@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 import os
 import shutil
 import subprocess
@@ -68,8 +69,8 @@ class WarpResult:
     corr: float = 0.0
     lag_sec: float = 0.0
     drift_ms: float = 0.0
-    aca_pad_sec: float = 0.0
-    inst_pad_sec: float = 0.0
+    aca_pad_sec: float | None = None
+    inst_pad_sec: float | None = None
     aca_drift_range_ms: float = 0.0
     inst_drift_range_ms: float = 0.0
     moved_to: str = ""
@@ -82,8 +83,8 @@ class WarpResult:
     inst_check_drift_ms: float = 0.0
     aca_lag_sec: float = 0.0
     inst_lag_sec: float = 0.0
-    aca_lag_sec: float = 0.0
-    inst_lag_sec: float = 0.0
+    aca_checkpoints: list | None = None
+    inst_checkpoints: list | None = None
 
 
 def peak_norm(y: np.ndarray) -> np.ndarray:
@@ -990,6 +991,12 @@ def _worker(payload: dict) -> dict:
     )
 
 
+def _pad_text(value: object) -> str:
+    if value is None:
+        return "n/a"
+    return f"{float(value):+.3f}"
+
+
 def write_csv(path: Path, rows: list[dict]) -> None:
     if not rows:
         path.write_text("", encoding="utf-8")
@@ -998,7 +1005,14 @@ def write_csv(path: Path, rows: list[dict]) -> None:
     with path.open("w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=fields)
         w.writeheader()
-        w.writerows(rows)
+        for row in rows:
+            cells = {}
+            for key, value in row.items():
+                if isinstance(value, (list, tuple)):
+                    cells[key] = json.dumps(list(value), ensure_ascii=False)
+                else:
+                    cells[key] = value
+            w.writerow(cells)
 
 
 def main() -> int:
@@ -1072,7 +1086,7 @@ def main() -> int:
         print(
             f"[{row['verdict'].upper()}] {row['folder']} "
             f"corr={row['corr']:.3f} drift={row['drift_ms']:.1f}ms "
-            f"pads=({row['aca_pad_sec']:+.3f},{row['inst_pad_sec']:+.3f}) "
+            f"pads=({_pad_text(row.get('aca_pad_sec'))},{_pad_text(row.get('inst_pad_sec'))}) "
             f"drange=({row['aca_drift_range_ms']:.0f},{row['inst_drift_range_ms']:.0f})ms"
             f"{moved}",
             flush=True,

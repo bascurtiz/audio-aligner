@@ -9,11 +9,12 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 import re
 import sys
 import traceback
 from concurrent.futures import ProcessPoolExecutor, as_completed
-from dataclasses import dataclass, asdict
+from dataclasses import asdict, dataclass
 from pathlib import Path
 
 import numpy as np
@@ -86,8 +87,9 @@ class CheckResult:
     inst_check_drift_ms: float = 0.0
     aca_lag_sec: float = 0.0
     inst_lag_sec: float = 0.0
-    aca_lag_sec: float = 0.0
-    inst_lag_sec: float = 0.0
+    # [time_sec, lag_ms, search_edge]. None means this result never measured them.
+    aca_checkpoints: list | None = None
+    inst_checkpoints: list | None = None
 
 
 def _peak_norm(y: np.ndarray) -> np.ndarray:
@@ -736,6 +738,42 @@ def _review_amount(points: list[tuple[float, float, bool]]) -> str:
     return f"{left} to {right}"
 
 
+def drift_ranges(points: list, *, limit_ms: float = DEFAULT_DRIFT_MS) -> str:
+    """One stem's 'drifts between' text. ``points`` are [time_sec, lag_ms, search_edge]."""
+    half = CHECKPOINT_WIN_SEC / 2.0
+    parsed: list[tuple[float, float, bool]] = []
+    for point in points or []:
+        if not isinstance(point, (list, tuple)) or len(point) < 2:
+            continue
+        parsed.append((float(point[0]), float(point[1]), bool(point[2]) if len(point) > 2 else False))
+    if not parsed:
+        return ""
+
+    def _over(point: tuple[float, float, bool]) -> bool:
+        return point[2] or abs(point[1]) > limit_ms
+
+    parts: list[str] = []
+    group: list[tuple[float, float, bool]] = []
+
+    def _flush() -> None:
+        if not group:
+            return
+        start = _review_clock(group[0][0] - half)
+        end = _review_clock(group[-1][0] + half)
+        parts.append(f"drifts between {start} - {end} ({_review_amount(group)})")
+        group.clear()
+
+    for point in parsed:
+        if not _over(point):
+            _flush()
+            continue
+        if group and (point[1] >= 0) != (group[-1][1] >= 0):
+            _flush()
+        group.append(point)
+    _flush()
+    return ", ".join(parts)
+
+
 def review_fail_parts(notes: str, *, limit_ms: float = DEFAULT_DRIFT_MS) -> tuple[str, str]:
     """Acapella drift notes, then instrumental drift notes.
 
@@ -746,44 +784,20 @@ def review_fail_parts(notes: str, *, limit_ms: float = DEFAULT_DRIFT_MS) -> tupl
     inst_parts: list[str] = []
     if not notes:
         return "", ""
-    half = CHECKPOINT_WIN_SEC / 2.0
     for kind, verdict, body in _CHECK_BLOCK_RE.findall(notes):
         if verdict != "fail" or kind not in _STEM_REVIEW_LABEL:
             continue
         gates = [float(value) for value in _OFFSET_GATE_RE.findall(body)]
         limit = min(gates) if gates else float(limit_ms)
         past_search = "offset_past_search" in body
-        points: list[tuple[float, float, bool]] = []
+        points: list[list] = []
         for time_text, lag_text in _CHECKPOINT_RE.findall(body):
             lag_ms = float(lag_text)
             railed = past_search and abs(lag_ms) >= _RAIL_ABS_MS
-            points.append((float(time_text), lag_ms, railed))
-
-        def _over(point: tuple[float, float, bool]) -> bool:
-            return point[2] or abs(point[1]) > limit
-
-        parts: list[str] = []
-        group: list[tuple[float, float, bool]] = []
-
-        def _flush() -> None:
-            if not group:
-                return
-            start = _review_clock(group[0][0] - half)
-            end = _review_clock(group[-1][0] + half)
-            parts.append(f"drifts between {start} - {end} ({_review_amount(group)})")
-            group.clear()
-
-        for point in points:
-            if not _over(point):
-                _flush()
-                continue
-            if group and (point[1] >= 0) != (group[-1][1] >= 0):
-                _flush()
-            group.append(point)
-        _flush()
-        if not parts:
+            points.append([float(time_text), lag_ms, railed])
+        text = drift_ranges(points, limit_ms=limit)
+        if not text:
             continue
-        text = ", ".join(parts)
         if kind == "aca_check":
             aca_parts.append(text)
         else:
@@ -866,7 +880,9 @@ def stem_verdicts(
     fails the stem. A step between two in-limit points does not.
 
     Returns (aca_verdict, inst_verdict, combined, aca_corr, inst_corr,
-    aca_drift_ms, inst_drift_ms, aca_lag_sec, inst_lag_sec, notes).
+    aca_drift_ms, inst_drift_ms, aca_lag_sec, inst_lag_sec, notes,
+    aca_checkpoints, inst_checkpoints). Checkpoints are
+    [time_sec, lag_ms, search_edge].
     """
     from demucs_vocals import load_instrumental_mono, load_vocals_mono
 
@@ -915,6 +931,14 @@ def stem_verdicts(
         aca_lag,
         inst_lag,
         notes,
+        [
+            [round(float(t), 3), round(float(lag) * 1000.0, 1), bool(railed)]
+            for t, lag, railed in aca_points
+        ],
+        [
+            [round(float(t), 3), round(float(lag) * 1000.0, 1), bool(railed)]
+            for t, lag, railed in inst_points
+        ],
     )
 
 
@@ -932,6 +956,8 @@ def apply_stem_check(result, acapella: Path, instrumental: Path, original: Path,
             aca_lag,
             inst_lag,
             stem_notes,
+            aca_points,
+            inst_points,
         ) = stem_verdicts(acapella, instrumental, original, **kwargs)
     except Exception as exc:  # noqa: BLE001 — one bad stem check must not abort the batch
         result.aca_verdict = "error"
@@ -947,6 +973,8 @@ def apply_stem_check(result, acapella: Path, instrumental: Path, original: Path,
     result.inst_check_drift_ms = inst_drift
     result.aca_lag_sec = aca_lag
     result.inst_lag_sec = inst_lag
+    result.aca_checkpoints = aca_points
+    result.inst_checkpoints = inst_points
     result.verdict = combined
     result.notes += f"; {stem_notes}"
 
@@ -999,7 +1027,7 @@ def process_folder(
 
     try:
         _emit_step(on_step, "score")
-        _mix, corr, lag, drift, weak, notes = analyze_alignment(
+        verdict, corr, lag, drift, weak, notes = analyze_alignment(
             aca,
             inst,
             orig,
@@ -1026,6 +1054,7 @@ def process_folder(
 
     result = CheckResult(
         folder=name,
+        verdict=verdict,
         corr=corr,
         lag_sec=lag,
         drift_ms=drift,
@@ -1099,13 +1128,24 @@ def list_work_folders(root: Path, limit: int | None) -> list[Path]:
     return folders
 
 
+def csv_cells(row: dict) -> dict:
+    """CSV cells. Checkpoint lists are stored as JSON text."""
+    out: dict = {}
+    for key, value in row.items():
+        if isinstance(value, (list, tuple)):
+            out[key] = json.dumps(list(value), ensure_ascii=False)
+        else:
+            out[key] = value
+    return out
+
+
 def write_csv(path: Path, rows: list[CheckResult]) -> None:
     fields = list(asdict(rows[0]).keys()) if rows else list(asdict(CheckResult(folder="", verdict="")).keys())
     with path.open("w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fields)
         writer.writeheader()
         for row in rows:
-            writer.writerow(asdict(row))
+            writer.writerow(csv_cells(asdict(row)))
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:

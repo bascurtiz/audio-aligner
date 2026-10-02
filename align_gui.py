@@ -23,8 +23,8 @@ from PyQt6.QtCore import Qt, QThread, QTimer, pyqtSignal
 from PyQt6.QtGui import QAction, QColor, QFont, QFontMetrics, QIcon, QPalette, QTextCharFormat, QTextCursor
 from PyQt6.QtWidgets import (
     QApplication,
+    QButtonGroup,
     QCheckBox,
-    QComboBox,
     QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
@@ -37,7 +37,9 @@ from PyQt6.QtWidgets import (
     QMessageBox,
     QProgressBar,
     QPushButton,
+    QRadioButton,
     QSizeGrip,
+    QSizePolicy,
     QSpinBox,
     QSplitter,
     QTableWidget,
@@ -52,6 +54,7 @@ from check_alignment import (
     DEFAULT_DRIFT_MS,
     DEFAULT_WEAK_WINDOW_FRAC,
     DEFAULT_WINDOW_CORR_MIN,
+    drift_ranges,
     review_fail_parts,
     review_fail_text,
 )
@@ -84,17 +87,39 @@ SORT_ROLE = SEEN_NAME_ROLE + 1
 ROW_ROLE = SORT_ROLE + 1
 
 
+def _json_value(value: object) -> object:
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, (list, tuple)):
+        return [_json_value(item) for item in value]
+    return None
+
+
 def _json_ready(row: dict) -> dict:
     """Keep only values the results file can store."""
     out: dict = {}
     for key, value in row.items():
-        if isinstance(value, Path):
-            value = str(value)
-        elif isinstance(value, float) and not math.isfinite(value):
-            value = None
-        if value is None or isinstance(value, (str, int, float, bool)):
-            out[str(key)] = value
+        stored = _json_value(value)
+        if stored is None and not isinstance(value, (list, tuple)) and value is not None:
+            if not isinstance(value, float):
+                continue
+        out[str(key)] = stored
     return out
+
+
+def _notes_columns(row: dict) -> tuple[str, str]:
+    """Drift ranges from the typed checkpoints, or from an older notes string."""
+    aca_pts = row.get("aca_checkpoints")
+    inst_pts = row.get("inst_checkpoints")
+    if not isinstance(aca_pts, list) and not isinstance(inst_pts, list):
+        return review_fail_parts(str(row.get("notes") or ""))
+    aca = drift_ranges(aca_pts or []) if row.get("aca_verdict") == "fail" else ""
+    inst = drift_ranges(inst_pts or []) if row.get("inst_verdict") == "fail" else ""
+    return aca, inst
 COL_FOLDER = 0
 COL_ACA_VERDICT = 1
 COL_INST_VERDICT = 2
@@ -610,6 +635,8 @@ class AlignWorker(QThread):
                     "drift_ms": result.drift_ms,
                     "aca_pad_sec": None,
                     "inst_pad_sec": None,
+                    "aca_checkpoints": result.aca_checkpoints,
+                    "inst_checkpoints": result.inst_checkpoints,
                     "path": str(live),
                     "moved_to": str(live) if result.renamed_to else "",
                     "notes": result.notes,
@@ -641,7 +668,14 @@ class AlignWorker(QThread):
         with path.open("w", newline="", encoding="utf-8") as f:
             w = csv.DictWriter(f, fieldnames=fields)
             w.writeheader()
-            w.writerows(rows)
+            for row in rows:
+                cells = {}
+                for key, value in row.items():
+                    if isinstance(value, (list, tuple)):
+                        cells[key] = json.dumps(list(value), ensure_ascii=False)
+                    else:
+                        cells[key] = value
+                w.writerow(cells)
 
 
 class MainWindow(QWidget):
@@ -787,32 +821,28 @@ class MainWindow(QWidget):
             COL_FOLDER: "Song folder name (processed output path stored on the row).",
             COL_ACA_VERDICT: (
                 "Acapella against the Demucs vocal.\n"
-                "pass / fail uses the correlation and drift limits.\n"
-                "The folder is tagged fail when either stem fails."
+                "Pass or fail uses correlation and drift."
             ),
             COL_INST_VERDICT: (
                 "Instrumental against the Demucs instrumental.\n"
-                "pass / fail uses the correlation and drift limits.\n"
-                "The folder is tagged fail when either stem fails."
+                "Pass or fail uses correlation and drift."
             ),
-            COL_CORR: "Global mix↔original correlation (higher is better).",
-            COL_DRIFT: "Mix lag range across windows in milliseconds (lower is better).",
-            COL_ACA: "Front pad applied to the acapella (seconds; + = silence inserted).",
-            COL_INST: "Front pad applied to the instrumental (seconds).",
+            COL_CORR: "Mix against the original.\nHigher is better.",
+            COL_DRIFT: "Mix lag across windows, in milliseconds.\nLower is better.",
+            COL_ACA: "Front pad on the acapella, in seconds.\nPlus inserts silence.",
+            COL_INST: "Front pad on the instrumental, in seconds.",
             COL_COMMENT: (
                 "What you hear on this track.\n"
-                "Click the cell and type. Saved with the row, kept when you re-check,\n"
-                "and still there after a restart."
+                "Click the cell and type.\n"
+                "It stays after a restart."
             ),
             COL_NOTES_ACA: (
-                "Where the acapella is off, so you can listen to that spot.\n"
-                "A stretch with no vocal in the stem is left out.\n"
-                "Hover a cell to read the full line."
+                "Where the acapella is off.\n"
+                "Hover a cell for the full line."
             ),
             COL_NOTES_INST: (
-                "Where the instrumental is off, so you can listen to that spot.\n"
-                "A stretch with no drums in the stem is left out.\n"
-                "Hover a cell to read the full line."
+                "Where the instrumental is off.\n"
+                "Hover a cell for the full line."
             ),
         }
         for col, tip in header_tips.items():
@@ -854,15 +884,8 @@ class MainWindow(QWidget):
         self.table.itemChanged.connect(self._on_comment_edited)
         self.table.setToolTip(
             "Results for each processed folder.\n"
-            "P or F in the player renames the folder.\n"
-            "Aca and Inst stay the measured checks.\n"
-            "Click a column header to sort; click again to reverse.\n"
-            "Drag column edges to resize; drag headers to reorder.\n"
-            "Right-click a row → Re-align / Re-check (keeps the list), Play, Edit, or Open folder.\n"
-            "Double-click a row to play.\n"
-            "Shift-click selects a range. Start align then redoes those rows only.\n"
-            "Click Comment and type what you hear. The note stays on that track.\n"
-            "Notes Aca and Notes Inst name the time ranges to review when that stem failed."
+            "Click a header to sort, or drag an edge to resize.\n"
+            "Right-click a row to re-align, play, or edit."
         )
         mid.addWidget(self.table)
 
@@ -874,7 +897,7 @@ class MainWindow(QWidget):
         log_font.setPixelSize(12)
         self.log_view.setFont(log_font)
         self.log_view.setToolTip(
-            "Live run log — engine, pads, loudness gains, and errors.\n"
+            "Live run log.\n"
             "Use Clear log to empty it."
         )
         mid.addWidget(self.log_view)
@@ -890,10 +913,8 @@ class MainWindow(QWidget):
         self.accuracy = QLabel("")
         self.accuracy.setObjectName("StatusLabel")
         self.accuracy.setToolTip(
-            "Folders tagged fail, out of every row in the list.\n"
-            "A row with no tag counts as failed when either stem failed.\n"
-            "Accuracy is the share that are not fail.\n"
-            "Example: Failed: 53/526 = 90% accuracy."
+            "Failed folders out of every row.\n"
+            "Accuracy is the share that are not fail."
         )
         status_row = QHBoxLayout()
         status_row.setContentsMargins(16, 4, 8, 8)
@@ -909,7 +930,7 @@ class MainWindow(QWidget):
         self._load_comments()
         self._load_results()
         self._apply_style()
-        self._on_engine_changed(self.engine.currentIndex())
+        self._on_engine_changed()
         self._watch_settings()
         # Clear-log wired after log_view exists
         self.clear_btn.clicked.connect(self.log_view.clear)
@@ -943,8 +964,8 @@ class MainWindow(QWidget):
 
         self.root_edit = QLineEdit(str(FAIL_ALL))
         self.root_edit.setToolTip(
-            "Song folder (with stems + original), or a root of song folders.\n"
-            "Each song needs _backup_before_align plus an original at the top level."
+            "One song folder, or a library root.\n"
+            "Each song needs a backup and an original."
         )
         browse = QPushButton("Browse…")
         browse.setToolTip("Choose a song folder or library root.")
@@ -958,34 +979,33 @@ class MainWindow(QWidget):
         row.addWidget(open_btn)
         form.addRow("Song / root folder", row)
 
-        self.engine = QComboBox()
-        self.engine.addItem("REAPER élastique (recommended)", "reaper")
-        self.engine.addItem("Rubber Band", "rubberband")
-        self.engine.setToolTip(
-            "Time-stretch engine for residual warp after gap restore.\n"
-            "REAPER élastique Pro is preferred; Rubber Band is the bundled fallback."
+        self.engine_group, engine_choice = self._radio_choice(
+            (
+                ("REAPER élastique (recommended)", "reaper"),
+                ("Rubber Band", "rubberband"),
+            ),
+            "Time-stretch engine after the gap restore.\n"
+            "REAPER élastique is preferred.\n"
+            "Rubber Band is the fallback.",
         )
-        self.engine.currentIndexChanged.connect(self._on_engine_changed)
-        form.addRow("Engine", self.engine)
-
-        self.declick = QComboBox()
-        self.declick.addItem("Auto-detect RX 11 De-click", "rx")
-        self.declick.addItem("Off", "off")
-        self.declick.setToolTip(
-            "Removes clicks on the acapella.\n"
-            "Auto-detect runs RX 11 De-click when that plugin is installed.\n"
-            "When it is not, the acapella is left as the stretch wrote it.\n"
-            "Off always leaves it that way.\n"
-            "RX runs after loudness, so the level match does not raise the click again.\n"
-            "The instrumental is left alone — a de-clicker treats drum hits as clicks."
+        self.declick_group, declick_choice = self._radio_choice(
+            (
+                ("Auto-detect RX 11 De-click", "rx"),
+                ("Off", "off"),
+            ),
+            "Removes clicks on the acapella only.\n"
+            "Auto-detect uses RX 11 when it is installed.\n"
+            "Otherwise the acapella stays as the stretch wrote it.",
         )
-        form.addRow("De-click", self.declick)
+        form.addRow(
+            self._source_pair("Engine", engine_choice, "De-click", declick_choice, lock_height=False)
+        )
 
         self.reaper_edit = QLineEdit("")
         self.reaper_edit.setPlaceholderText(r"Auto-detect  (e.g. C:\Program Files\REAPER (x64)\reaper.exe)")
         self.reaper_edit.setToolTip(
             "Path to reaper.exe.\n"
-            "Leave empty to auto-detect the usual install locations."
+            "Leave empty to auto-detect."
         )
         reaper_browse = QPushButton("…")
         reaper_browse.setFixedWidth(36)
@@ -999,21 +1019,90 @@ class MainWindow(QWidget):
         self.only_edit = QLineEdit()
         self.only_edit.setPlaceholderText("Optional name filter, e.g. 0647")
         self.only_edit.setToolTip(
-            "Only process folders whose name contains this text\n"
-            "(case-insensitive). Leave empty for all."
+            "Only folders whose name contains this text.\n"
+            "Leave empty for all."
         )
-        form.addRow("Only (substring)", self.only_edit)
 
         self.limit_spin = QSpinBox()
         self.limit_spin.setRange(0, 9999)
         self.limit_spin.setSpecialValueText("All")
         self.limit_spin.setValue(0)
         self.limit_spin.setToolTip(
-            "Process at most this many folders (after the name filter).\n"
-            "All = no limit."
+            "Process at most this many folders.\n"
+            "All means no limit."
         )
-        form.addRow("Limit folders", self.limit_spin)
+        form.addRow(self._source_pair("Only (substring)", self.only_edit, "Limit folders", self.limit_spin))
+
+        self.csv_edit = QLineEdit(str(OUT_CSV))
+        self.csv_edit.setToolTip("Where Start align and Check alignment write the results CSV.")
+        csv_browse = QPushButton("…")
+        csv_browse.setFixedWidth(36)
+        csv_browse.setToolTip("Choose the results CSV.")
+        csv_browse.clicked.connect(self._browse_csv)
+        csv_row = QHBoxLayout()
+        csv_row.addWidget(self.csv_edit, stretch=1)
+        csv_row.addWidget(csv_browse)
+        form.addRow("Results CSV", csv_row)
         return box
+
+    def _radio_choice(self, options: tuple[tuple[str, str], ...], tooltip: str) -> tuple[QButtonGroup, QWidget]:
+        group = QButtonGroup(self)
+        group.setExclusive(True)
+        host = QWidget()
+        host.setToolTip(tooltip)
+        lay = QVBoxLayout(host)
+        lay.setContentsMargins(0, 2, 0, 0)
+        lay.setSpacing(4)
+        for index, (label, value) in enumerate(options):
+            button = QRadioButton(label)
+            button.setToolTip(tooltip)
+            button.setProperty("choice", value)
+            group.addButton(button, index)
+            lay.addWidget(button)
+        first = group.buttons()
+        if first:
+            first[0].setChecked(True)
+        return group, host
+
+    def _radio_value(self, group: QButtonGroup, default: str) -> str:
+        button = group.checkedButton()
+        if button is None:
+            return default
+        value = button.property("choice")
+        return str(value) if value else default
+
+    def _set_radio(self, group: QButtonGroup, value: str) -> None:
+        for button in group.buttons():
+            if button.property("choice") == value:
+                button.setChecked(True)
+                return
+
+    def _source_pair(
+        self,
+        left_label: str,
+        left: QWidget,
+        right_label: str,
+        right: QWidget,
+        *,
+        lock_height: bool = True,
+    ) -> QWidget:
+        host = QWidget()
+        row = QHBoxLayout(host)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(16)
+        v_policy = QSizePolicy.Policy.Fixed if lock_height else QSizePolicy.Policy.Preferred
+        for label, widget in ((left_label, left), (right_label, right)):
+            widget.setSizePolicy(QSizePolicy.Policy.Expanding, v_policy)
+            col = QVBoxLayout()
+            col.setContentsMargins(0, 0, 0, 0)
+            col.setSpacing(4)
+            caption = QLabel(label)
+            caption.setObjectName("OptionFieldLabel")
+            caption.setToolTip(widget.toolTip())
+            col.addWidget(caption)
+            col.addWidget(widget)
+            row.addLayout(col, 1)
+        return host
 
     def _build_options(self) -> QGroupBox:
         box = QGroupBox("OPTIONS")
@@ -1021,33 +1110,31 @@ class MainWindow(QWidget):
         form = QFormLayout(box)
 
         flags = QHBoxLayout()
+        flags.setSpacing(18)
         self.dry_run = QCheckBox("Dry run (analyze only)")
         self.dry_run.setToolTip(
-            "Measure pads and drift only — do not write warped stems,\n"
-            "apply loudness, or rename folders."
+            "Measure pads and drift only.\n"
+            "Does not write stems or rename folders."
         )
         self.move_on_pass = QCheckBox("Tag folder _[pass] / _[fail]")
         self.move_on_pass.setChecked(True)
         self.move_on_pass.setToolTip(
-            "After the post-align check, rename the song folder in place.\n"
-            "Pass ends with _[pass]. Fail ends with _[fail].\n"
-            "The folder stays in the same directory."
+            "Rename the song folder after the check.\n"
+            "Pass ends with _[pass].\n"
+            "Fail ends with _[fail]."
         )
-        flags.addWidget(self.dry_run)
-        flags.addWidget(self.move_on_pass)
-        flags.addStretch(1)
-        form.addRow(flags)
-
         self.gaps_cut = QCheckBox("Silences cut between vocal phrases")
         self.gaps_cut.setChecked(True)
         self.gaps_cut.setToolTip(
-            "On when the acapella had the rests removed, so phrases sit back to back.\n"
-            "Those rests are put back from the original vocal, and the vocal keeps\n"
-            "that placement instead of following the instrumental beat.\n"
-            "Off when the acapella still has its original rests. Phrase placement\n"
-            "is skipped, and the vocal follows the instrumental clock."
+            "On when rests were cut out of the acapella.\n"
+            "Those rests are put back from the original vocal.\n"
+            "Off when the acapella still has its rests."
         )
-        form.addRow(self.gaps_cut)
+        flags.addWidget(self.dry_run)
+        flags.addWidget(self.move_on_pass)
+        flags.addWidget(self.gaps_cut)
+        flags.addStretch(1)
+        form.addRow(flags)
 
         nums = QHBoxLayout()
         self.max_pad = QDoubleSpinBox()
@@ -1056,8 +1143,8 @@ class MainWindow(QWidget):
         self.max_pad.setSuffix(" s")
         self.max_pad.setValue(DEFAULT_MAX_PAD_SEC)
         self.max_pad.setToolTip(
-            "Maximum front pad/trim searched when lining stems up to the original\n"
-            "(global chroma offset). Raise for songs with a long pre-roll."
+            "Largest front pad or trim searched against the original.\n"
+            "Raise this for a long pre-roll."
         )
 
         self.corr_min = QDoubleSpinBox()
@@ -1066,9 +1153,8 @@ class MainWindow(QWidget):
         self.corr_min.setDecimals(2)
         self.corr_min.setValue(DEFAULT_CORR_MIN)
         self.corr_min.setToolTip(
-            "Minimum correlation for the acapella against the Demucs vocal,\n"
-            "and for the instrumental against the Demucs instrumental.\n"
-            "Higher = stricter (more fails)."
+            "Minimum correlation against the Demucs reference.\n"
+            "Higher is stricter."
         )
 
         self.drift_ms = QDoubleSpinBox()
@@ -1077,12 +1163,9 @@ class MainWindow(QWidget):
         self.drift_ms.setSuffix(" ms")
         self.drift_ms.setValue(DEFAULT_DRIFT_MS)
         self.drift_ms.setToolTip(
-            "Maximum offset of either stem against its Demucs reference, at\n"
-            "points every 30 seconds through the song.\n"
-            "<=5 ms is the target. 10–20 ms is suspect and still passes.\n"
-            "Past 20 ms the stem is flagged.\n"
-            "A sudden step past 20 ms between points also fails.\n"
-            "A slow walk that stays inside 20 ms does not."
+            "Maximum offset of either stem against its Demucs reference.\n"
+            "Past this limit the stem fails.\n"
+            "A slow drift inside the limit still passes."
         )
 
         self.window_corr = QDoubleSpinBox()
@@ -1091,8 +1174,8 @@ class MainWindow(QWidget):
         self.window_corr.setDecimals(2)
         self.window_corr.setValue(DEFAULT_WINDOW_CORR_MIN)
         self.window_corr.setToolTip(
-            "Per-window correlation floor. Windows below this are “weak”\n"
-            "and counted toward the weak-fraction fail limit."
+            "Windows below this correlation count as weak.\n"
+            "They add toward the weak-fraction limit."
         )
 
         self.weak_frac = QDoubleSpinBox()
@@ -1101,8 +1184,8 @@ class MainWindow(QWidget):
         self.weak_frac.setDecimals(2)
         self.weak_frac.setValue(DEFAULT_WEAK_WINDOW_FRAC)
         self.weak_frac.setToolTip(
-            "Fail if this fraction of windows are below Win corr.\n"
-            "Example: 0.35 ≈ fail when more than ~35% of windows are weak."
+            "Fail when this share of windows is weak.\n"
+            "0.35 fails when about 35% of windows are weak."
         )
 
         tip_labels = {
@@ -1134,41 +1217,38 @@ class MainWindow(QWidget):
         self.start_btn = QPushButton("Start align")
         self.start_btn.setObjectName("primary")
         self.start_btn.setToolTip(
-            "Run gap-aware align + warp + Demucs loudness match.\n"
-            "Silences cut between vocal phrases controls whether rests are put back.\n"
-            "With two or more rows selected, only those songs are redone.\n"
-            "Otherwise the folders matched by Source / Only / Limit.\n"
-            "Other rows stay in the list, comments included."
+            "Align, warp, and match loudness.\n"
+            "A selected row is that song.\n"
+            "With nothing selected, Source, Only, and Limit choose the folders."
         )
         self.start_btn.clicked.connect(lambda: self._start("align"))
         self.check_btn = QPushButton("Check alignment")
         self.check_btn.setToolTip(
-            "Score the current acapella + instrumental against the original.\n"
-            "Pass when each stem stays within the offset limit at every checkpoint.\n"
-            "Does not warp. Tag folder still renames _[pass] / _[fail] unless Dry run is on.\n"
-            "With two or more rows selected, only those songs are checked."
+            "Score the stems against the original.\n"
+            "Does not warp.\n"
+            "A selected row is that song."
         )
         self.check_btn.clicked.connect(lambda: self._start("check"))
         self.stop_btn = QPushButton("Stop")
         self.stop_btn.setEnabled(False)
         self.stop_btn.setToolTip(
-            "Stop after the folder currently in progress finishes.\n"
-            "Already-written stems are kept."
+            "Stop after the current folder finishes.\n"
+            "Stems already written are kept."
         )
         self.stop_btn.clicked.connect(self._stop)
         self.play_btn = QPushButton("♫ Play")
         self.play_btn.setObjectName("playBtn")
         self.play_btn.setToolTip(
-            "Open Audio Aligner - Player for the selected results row\n"
-            "(acapella + instrumental + original).\n"
+            "Open the player for the selected row.\n"
             "Double-click a row to play as well."
         )
         self.play_btn.clicked.connect(self._play_selected)
         self.edit_btn = QPushButton("Edit")
         self.edit_btn.setObjectName("editBtn")
         self.edit_btn.setToolTip(
-            "Drag acapella sections against the Demucs vocal.\n"
-            "Apply writes that layout, then re-aligns the acapella (élastique and loudness). The instrumental is left as it is."
+            "Drag sections against the Demucs reference.\n"
+            "Apply re-aligns the stem you are editing.\n"
+            "The other stem is left as it is."
         )
         self.edit_btn.clicked.connect(self._edit_selected)
         self.progress_btn = QPushButton("Show progress")
@@ -1312,6 +1392,22 @@ class MainWindow(QWidget):
                 background-color: {c['panel2']};
             }}
             QCheckBox::indicator:checked {{
+                background-color: {c['accent']};
+                border: 1px solid {c['accent_hov']};
+            }}
+            QRadioButton {{
+                color: {c['log_fg']};
+                background: transparent;
+                spacing: 8px;
+            }}
+            QRadioButton::indicator {{
+                width: 14px;
+                height: 14px;
+                border-radius: 7px;
+                border: 1px solid {c['border']};
+                background-color: {c['panel2']};
+            }}
+            QRadioButton::indicator:checked {{
                 background-color: {c['accent']};
                 border: 1px solid {c['accent_hov']};
             }}
@@ -1570,9 +1666,19 @@ class MainWindow(QWidget):
         if path:
             self.reaper_edit.setText(path)
 
-    def _on_engine_changed(self, _index: int) -> None:
-        is_reaper = self.engine.currentData() == "reaper"
-        self.reaper_edit.setEnabled(is_reaper)
+    def _browse_csv(self) -> None:
+        current = self.csv_edit.text().strip() or str(OUT_CSV)
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Results CSV",
+            current,
+            "CSV (*.csv);;All files (*)",
+        )
+        if path:
+            self.csv_edit.setText(path)
+
+    def _on_engine_changed(self, *_args: object) -> None:
+        self.reaper_edit.setEnabled(self._radio_value(self.engine_group, "reaper") == "reaper")
 
     def _load_settings(self) -> None:
         try:
@@ -1586,17 +1692,16 @@ class MainWindow(QWidget):
             self.root_edit.setText(root)
         engine = data.get("engine")
         if isinstance(engine, str):
-            idx = self.engine.findData(engine)
-            if idx >= 0:
-                self.engine.setCurrentIndex(idx)
+            self._set_radio(self.engine_group, engine)
         declick = data.get("declick")
         if isinstance(declick, str):
-            idx = self.declick.findData(declick)
-            if idx >= 0:
-                self.declick.setCurrentIndex(idx)
+            self._set_radio(self.declick_group, declick)
         reaper = data.get("reaper_exe")
         if isinstance(reaper, str):
             self.reaper_edit.setText(reaper)
+        csv_path = data.get("csv_path")
+        if isinstance(csv_path, str) and csv_path.strip():
+            self.csv_edit.setText(csv_path)
         only = data.get("only")
         if isinstance(only, str):
             self.only_edit.setText(only)
@@ -1687,11 +1792,16 @@ class MainWindow(QWidget):
             return None
         return [row for row in data if isinstance(row, dict)]
 
+    def _csv_path(self) -> Path:
+        text = self.csv_edit.text().strip()
+        return Path(text) if text else OUT_CSV
+
     def _read_results_csv(self) -> list[dict]:
-        if not OUT_CSV.is_file():
+        path = self._csv_path()
+        if not path.is_file():
             return []
         try:
-            with OUT_CSV.open(newline="", encoding="utf-8") as handle:
+            with path.open(newline="", encoding="utf-8") as handle:
                 return [dict(row) for row in csv.DictReader(handle)]
         except (OSError, csv.Error, UnicodeError):
             return []
@@ -1727,9 +1837,10 @@ class MainWindow(QWidget):
     def _save_settings(self) -> None:
         data = {
             "root": self.root_edit.text(),
-            "engine": self.engine.currentData(),
-            "declick": self.declick.currentData(),
+            "engine": self._radio_value(self.engine_group, "reaper"),
+            "declick": self._radio_value(self.declick_group, "rx"),
             "reaper_exe": self.reaper_edit.text(),
+            "csv_path": self.csv_edit.text(),
             "only": self.only_edit.text(),
             "limit": self.limit_spin.value(),
             "dry_run": self.dry_run.isChecked(),
@@ -1757,9 +1868,11 @@ class MainWindow(QWidget):
         save = self._schedule_settings_save
         self.root_edit.textChanged.connect(save)
         self.reaper_edit.textChanged.connect(save)
+        self.csv_edit.textChanged.connect(save)
         self.only_edit.textChanged.connect(save)
-        self.engine.currentIndexChanged.connect(save)
-        self.declick.currentIndexChanged.connect(save)
+        self.engine_group.buttonToggled.connect(save)
+        self.declick_group.buttonToggled.connect(save)
+        self.engine_group.buttonToggled.connect(self._on_engine_changed)
         self.limit_spin.valueChanged.connect(save)
         self.max_pad.valueChanged.connect(save)
         self.corr_min.valueChanged.connect(save)
@@ -1774,11 +1887,16 @@ class MainWindow(QWidget):
         self._settings_timer.start()
 
     def closeEvent(self, event) -> None:  # noqa: N802
+        worker = self.worker
+        if worker is not None and worker.isRunning():
+            worker.abort()
+            worker.wait()
+            QApplication.processEvents()
         self._save_settings()
         self._save_comments()
         # A new run clears the table before the first song finishes. Closing
         # in that window must not wipe the previous results file.
-        if self.table.rowCount() or not (self.worker and self.worker.isRunning()):
+        if self.table.rowCount() or worker is None or not worker.isRunning():
             self._save_results()
         super().closeEvent(event)
 
@@ -1786,8 +1904,8 @@ class MainWindow(QWidget):
         limit = self.limit_spin.value()
         return {
             "root": self.root_edit.text().strip(),
-            "engine": self.engine.currentData(),
-            "declick": self.declick.currentData(),
+            "engine": self._radio_value(self.engine_group, "reaper"),
+            "declick": self._radio_value(self.declick_group, "rx"),
             "reaper_exe": self.reaper_edit.text().strip() or None,
             "only": self.only_edit.text().strip() or None,
             "limit": limit if limit > 0 else None,
@@ -1799,7 +1917,7 @@ class MainWindow(QWidget):
             "drift_ms": float(self.drift_ms.value()),
             "window_corr_min": float(self.window_corr.value()),
             "weak_window_frac": float(self.weak_frac.value()),
-            "csv": str(OUT_CSV),
+            "csv": str(self._csv_path()),
         }
 
     def _start(self, mode: str = "align") -> None:
@@ -1815,12 +1933,24 @@ class MainWindow(QWidget):
         else:
             folders = list_song_folders(root, opts.get("only"), opts.get("limit"))
         picked = self._selected_folders()
-        if len(picked) >= 2:
+        if picked:
             folders = picked
             opts["folders"] = [str(path) for path in folders]
             opts["only"] = None
             opts["limit"] = None
             opts["selection_run"] = True
+        elif folders and opts["move_on_pass"] and not opts["dry_run"]:
+            answer = QMessageBox.question(
+                self,
+                "Tag every folder",
+                f"No row is selected.\n\n"
+                f"This will rename {len(folders)} song folder(s) under:\n{root}\n\n"
+                "Continue?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
         if not folders:
             QMessageBox.warning(self, "Nothing to process", f"No song folders under:\n{root}")
             return
@@ -1905,16 +2035,18 @@ class MainWindow(QWidget):
         else:
             self.status.setText("Checking…" if mode == "check" else "Running…")
 
-        self.worker = AlignWorker(opts)
-        self.worker.log.connect(self._append_log)
-        self.worker.folder_start.connect(self._on_folder_start)
-        self.worker.step.connect(self._on_worker_step)
-        self.worker.folder_done.connect(self._on_folder_done)
-        self.worker.finished_ok.connect(self._on_finished)
-        self.worker.failed.connect(self._on_failed)
+        worker = AlignWorker(opts)
+        worker.log.connect(self._append_log)
+        worker.folder_start.connect(self._on_folder_start)
+        worker.step.connect(self._on_worker_step)
+        worker.folder_done.connect(self._on_folder_done)
+        worker.finished_ok.connect(self._on_finished)
+        worker.failed.connect(self._on_failed)
+        worker.finished.connect(lambda worker=worker: self._retire_worker(worker))
+        self.worker = worker
         self._open_progress_modal(mode, len(folders))
         self._batch_busy = True
-        self.worker.start()
+        worker.start()
         self._sync_progress_button()
 
     def _open_progress_modal(self, mode: str, folder_total: int) -> None:
@@ -2040,11 +2172,6 @@ class MainWindow(QWidget):
 
     def _editor_apply_scored(self, row: dict) -> None:
         found = self._find_row_for_result(row)
-        if found is not None:
-            for key, col in (("aca_pad_sec", COL_ACA), ("inst_pad_sec", COL_INST)):
-                item = self.table.item(found, col)
-                if item is not None and row.get(key) is None:
-                    row[key] = item.data(SORT_ROLE)
         self.table.setSortingEnabled(False)
         try:
             self._update_or_append_result_row(row)
@@ -2186,11 +2313,28 @@ class MainWindow(QWidget):
                 return r
         return None
 
+    def _keep_measured_pads(self, index: int, row: dict) -> None:
+        """A check does not measure pads. Leave the pads the align stored."""
+        item = self.table.item(index, COL_FOLDER)
+        raw = item.data(ROW_ROLE) if item is not None else None
+        previous: dict = {}
+        if isinstance(raw, str) and raw:
+            try:
+                loaded = json.loads(raw)
+            except json.JSONDecodeError:
+                loaded = None
+            if isinstance(loaded, dict):
+                previous = loaded
+        for key in ("aca_pad_sec", "inst_pad_sec"):
+            if row.get(key) is None and previous.get(key) not in (None, ""):
+                row[key] = previous[key]
+
     def _update_or_append_result_row(self, row: dict) -> None:
         existing = self._find_row_for_result(row)
         if existing is None:
             self._append_result_row(row)
             return
+        self._keep_measured_pads(existing, row)
         self._fill_result_row(existing, row)
 
     def _on_table_double_clicked(self, index) -> None:
@@ -2280,7 +2424,7 @@ class MainWindow(QWidget):
         drift_txt, drift_sort = _num("drift_ms", "{:.1f}")
         aca_txt, aca_sort = _num("aca_pad_sec", "{:+.3f}")
         inst_txt, inst_sort = _num("inst_pad_sec", "{:+.3f}")
-        aca_notes, inst_notes = review_fail_parts(str(row.get("notes") or ""))
+        aca_notes, inst_notes = _notes_columns(row)
         values = {
             COL_FOLDER: folder_name,
             COL_ACA_VERDICT: aca_verdict,
@@ -2481,7 +2625,7 @@ class MainWindow(QWidget):
         try:
             open_section_editor(
                 song,
-                declick=self.declick.currentData() or "rx",
+                declick=self._radio_value(self.declick_group, "rx"),
                 on_apply_begin=self._editor_apply_begin,
                 on_apply_step=self._editor_apply_step,
                 on_apply_scored=self._editor_apply_scored,
@@ -2567,7 +2711,6 @@ class MainWindow(QWidget):
         self.start_btn.setEnabled(True)
         self.check_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
-        self.worker = None
         self._batch_busy = False
         self._close_progress_modal()
         self._sync_progress_button()
@@ -2591,7 +2734,6 @@ class MainWindow(QWidget):
         self.start_btn.setEnabled(True)
         self.check_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
-        self.worker = None
         self._batch_busy = False
         self._close_progress_modal()
         self._sync_progress_button()
@@ -2603,6 +2745,11 @@ class MainWindow(QWidget):
         self.status.setText("Failed")
         self._append_log(message)
         QMessageBox.critical(self, "Align failed", message.splitlines()[0])
+
+    def _retire_worker(self, worker: AlignWorker) -> None:
+        if self.worker is worker:
+            self.worker = None
+        worker.deleteLater()
 
 
 def _apply_dark_palette(app: QApplication) -> None:

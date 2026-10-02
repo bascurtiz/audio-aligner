@@ -33,6 +33,7 @@ from PyQt6.QtGui import (
     QShortcut,
 )
 from PyQt6.QtWidgets import (
+    QApplication,
     QCheckBox,
     QComboBox,
     QHBoxLayout,
@@ -1322,9 +1323,9 @@ class SectionEditor(QWidget):
         self.stem_box.addItem("Acapella", "aca")
         self.stem_box.addItem("Instrumental", "inst")
         self.stem_box.setToolTip(
-            "Acapella shows the Demucs vocal and the acapella output.\n"
-            "Instrumental shows the Demucs instrumental and the instrumental output.\n"
-            "Drag sections on either one. Apply writes the stem you are looking at."
+            "Acapella shows the Demucs vocal and the acapella.\n"
+            "Instrumental shows the Demucs instrumental and its output.\n"
+            "Apply writes the stem you are looking at."
         )
         self.stem_box.currentIndexChanged.connect(self._on_stem_changed)
         self.status = QLabel("Loading Demucs vocal and acapella…")
@@ -1334,16 +1335,15 @@ class SectionEditor(QWidget):
         self.with_demucs = QCheckBox("Play against Demucs vocal")
         self.with_demucs.setChecked(True)
         self.with_demucs.setToolTip(
-            "On: acapella + Demucs vocal, so you hear the alignment. "
-            "Off: acapella + instrumental."
+            "On plays the acapella against the Demucs vocal.\n"
+            "Off plays the acapella with the instrumental."
         )
         self.with_demucs.toggled.connect(lambda _checked: self._sync_gains())
         self.align_lines = QCheckBox("Alignment lines")
         self.align_lines.setChecked(True)
         self.align_lines.setToolTip(
-            "Vertical lines mark the same moment on the Demucs vocal and the acapella. "
-            "Drag a section and its waveform moves against those lines. "
-            "Zoom in and the lines get closer."
+            "Lines mark the same moment on both lanes.\n"
+            "Drag a section and the wave moves against them."
         )
         self.align_lines.toggled.connect(self._toggle_alignment)
         self.timeline.mixChanged.connect(self._sync_gains)
@@ -1354,17 +1354,17 @@ class SectionEditor(QWidget):
         self.sections_lbl.setStyleSheet(f"color: {FG}; background: transparent;")
         self.fewer_btn = QPushButton("-")
         self.fewer_btn.setEnabled(False)
-        self.fewer_btn.setToolTip("Join nearby phrases into longer sections you can drag.")
+        self.fewer_btn.setToolTip("Join nearby phrases into longer sections.")
         self.fewer_btn.clicked.connect(lambda: self._retarget_sections(-1))
         self.more_btn = QPushButton("+")
         self.more_btn.setEnabled(False)
-        self.more_btn.setToolTip("Split the longest phrases into shorter sections you can drag.")
+        self.more_btn.setToolTip("Split the longest phrases into shorter sections.")
         self.more_btn.clicked.connect(lambda: self._retarget_sections(1))
         self.apply_btn = QPushButton("Apply")
         self.apply_btn.setEnabled(False)
         self.apply_btn.setToolTip(
-            "Write the dragged sections, then re-align that acapella with élastique "
-            "against the Demucs vocal and match its loudness. The instrumental is not changed."
+            "Write the dragged sections, then re-align this acapella.\n"
+            "The instrumental is not changed."
         )
         self.apply_btn.clicked.connect(self._apply)
 
@@ -1461,10 +1461,8 @@ class SectionEditor(QWidget):
 
         self._busy = False
         self._apply_worker: _ApplyWorker | None = None
-        self._loader = _Loader(folder)
-        self._loader.loaded.connect(self._on_loaded)
-        self._loader.failed.connect(self._on_failed)
-        self._loader.start()
+        self._loader: _Loader | None = None
+        self._start_loader(self._on_loaded)
 
     def _shortcuts_bar(self) -> QWidget:
         self._shortcuts_host = QWidget()
@@ -1722,31 +1720,30 @@ class SectionEditor(QWidget):
         if self.timeline.stem == "inst":
             self.with_demucs.setText("Play against Demucs instrumental")
             self.with_demucs.setToolTip(
-                "On: instrumental output + Demucs instrumental. "
-                "Off: instrumental output alone."
+                "On plays the output against the Demucs instrumental.\n"
+                "Off plays the instrumental output alone."
             )
             self.align_lines.setToolTip(
-                "Vertical lines mark the same moment on the Demucs instrumental "
-                "and the instrumental output."
+                "Lines mark the same moment on both lanes.\n"
+                "Drag a section and the wave moves against them."
             )
             self.apply_btn.setToolTip(
-                "Write the dragged sections, then re-align that instrumental with élastique "
-                "against the Demucs instrumental and match its loudness. The acapella is not changed."
+                "Write the dragged sections, then re-align this instrumental.\n"
+                "The acapella is not changed."
             )
             return
         self.with_demucs.setText("Play against Demucs vocal")
         self.with_demucs.setToolTip(
-            "On: acapella + Demucs vocal, so you hear the alignment. "
-            "Off: acapella + instrumental."
+            "On plays the acapella against the Demucs vocal.\n"
+            "Off plays the acapella with the instrumental."
         )
         self.align_lines.setToolTip(
-            "Vertical lines mark the same moment on the Demucs vocal and the acapella. "
-            "Drag a section and its waveform moves against those lines. "
-            "Zoom in and the lines get closer."
+            "Lines mark the same moment on both lanes.\n"
+            "Drag a section and the wave moves against them."
         )
         self.apply_btn.setToolTip(
-            "Write the dragged sections, then re-align that acapella with élastique "
-            "against the Demucs vocal and match its loudness. The instrumental is not changed."
+            "Write the dragged sections, then re-align this acapella.\n"
+            "The instrumental is not changed."
         )
 
     def _mix_gains(self) -> tuple[float, str | None]:
@@ -2077,21 +2074,28 @@ class SectionEditor(QWidget):
         worker.step.connect(self._relay_apply_step)
         worker.finished_ok.connect(self._on_apply_done)
         worker.failed.connect(self._on_apply_failed)
+        worker.finished.connect(lambda worker=worker: self._retire_thread(worker, "_apply_worker"))
         self._apply_worker = worker
         worker.start()
 
-    def _release_apply_worker(self) -> None:
-        worker = self._apply_worker
-        self._apply_worker = None
-        if worker is not None:
-            worker.deleteLater()
+    def _start_loader(self, on_loaded) -> None:
+        loader = _Loader(self.folder)
+        loader.loaded.connect(on_loaded)
+        loader.failed.connect(self._on_failed)
+        loader.finished.connect(lambda loader=loader: self._retire_thread(loader, "_loader"))
+        self._loader = loader
+        loader.start()
+
+    def _retire_thread(self, thread: QThread, attr: str) -> None:
+        if getattr(self, attr) is thread:
+            setattr(self, attr, None)
+        thread.deleteLater()
 
     def _relay_apply_step(self, step_id: str) -> None:
         if self._on_apply_step is not None:
             self._on_apply_step(step_id)
 
     def _on_apply_done(self, payload: dict) -> None:
-        self._release_apply_worker()
         try:
             if self._on_apply_scored is not None:
                 self._on_apply_scored(payload)
@@ -2108,10 +2112,7 @@ class SectionEditor(QWidget):
         self._apply_summary = (
             f"Re-aligned. Acapella {aca or '—'}, instrumental {inst or '—'}."
         )
-        self._loader = _Loader(self.folder)
-        self._loader.loaded.connect(self._on_reloaded)
-        self._loader.failed.connect(self._on_failed)
-        self._loader.start()
+        self._start_loader(self._on_reloaded)
 
     def _on_reloaded(self, data: dict) -> None:
         applied = getattr(self, "_applied_stem", "aca")
@@ -2150,7 +2151,6 @@ class SectionEditor(QWidget):
         self._set_busy(False)
         self.status.setText(message)
         QMessageBox.warning(self, "Re-process failed", message)
-        self._release_apply_worker()
 
     def showEvent(self, event) -> None:  # noqa: N802
         super().showEvent(event)
@@ -2181,9 +2181,14 @@ class SectionEditor(QWidget):
         return super().eventFilter(obj, event)
 
     def closeEvent(self, event) -> None:  # noqa: N802
-        if self._busy:
+        apply = self._apply_worker
+        loader = self._loader
+        if self._busy or (apply is not None and apply.isRunning()):
             event.ignore()
             return
+        if loader is not None and loader.isRunning():
+            loader.wait()
+            QApplication.processEvents()
         self._halt_audio()
         super().closeEvent(event)
 
