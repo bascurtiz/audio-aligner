@@ -1,5 +1,7 @@
 # Audio Aligner
 
+[![Audio Aligner (teaser)](https://i.ytimg.com/vi/6UzBik4-adg/maxresdefault.jpg)](https://www.youtube.com/watch?v=6UzBik4-adg)
+
 Aligns an acapella and an instrumental to the original mix, then checks the result.
 
 The window is `align_gui.py`. REAPER élastique is the stretch engine. Rubber Band is the fallback when REAPER is not available. Each song folder is renamed in place with `_[pass]` or `_[fail]`.
