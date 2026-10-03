@@ -25,9 +25,9 @@ from align_model.benchmark import (
 )
 from align_model.beats import beat_alignment_score
 from align_model.evidence import EvidencePoint, context_weights, fuse_candidates
-from align_model.gaps import PhraseUnit, render_gap_aware, spans_from_units
+from align_model.gaps import MapSpan, PhraseUnit, render_gap_aware, spans_from_units
 from align_model.params import resolve_profile
-from align_model.pipeline import _model_phrase, map_from_points
+from align_model.pipeline import _model_phrase, _with_silence, map_from_points
 from align_model.quality import apply_codes, is_compensating, stamp_result
 from align_model.time_map import (
     _clamp_accel,
@@ -448,6 +448,22 @@ class GapTests(unittest.TestCase):
 
         self.assertLess(abs(peak_hz(early) - 196.0), 4.0)
         self.assertLess(abs(peak_hz(late) - 330.0), 4.0)
+
+    def test_short_speech_keeps_its_solved_duration(self) -> None:
+        spans = _with_silence(
+            [
+                MapSpan("speech", 0.0, 0.20, 1.00, 1.20),
+                MapSpan("speech", 0.20, 0.215, 1.10, 1.115),
+                MapSpan("speech", 0.215, 0.215, 1.50, 1.50),
+            ],
+            2.0,
+        )
+        speech = [span for span in spans if span.kind == "speech"]
+        self.assertAlmostEqual(speech[0].dst_end - speech[0].dst_start, 0.20, places=4)
+        self.assertAlmostEqual(speech[1].dst_start, 1.20, places=4)
+        self.assertAlmostEqual(speech[1].dst_end - speech[1].dst_start, 0.015, places=4)
+        self.assertGreater(speech[2].dst_end, speech[2].dst_start)
+        self.assertLess(speech[2].dst_end - speech[2].dst_start, 0.005)
 
     def test_phrase_offset_is_applied_once(self) -> None:
         """Query 9.900–11.900 against reference 10.000–12.000 stays a +100 ms map."""

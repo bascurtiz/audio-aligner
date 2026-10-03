@@ -278,9 +278,13 @@ def _with_silence(pieces: list[MapSpan], duration: float) -> list[MapSpan]:
     spans: list[MapSpan] = []
     prev = 0.0
     for span in ordered:
-        dur = max(0.04, float(span.dst_end - span.dst_start))
+        solved = float(span.dst_end - span.dst_start)
+        # Keep the duration the solver produced. Only a zero-length span
+        # gets a stand-in, so the timeline still moves forward.
+        dur = solved if solved > 1e-4 else 1e-3
         dst0 = max(float(span.dst_start), prev)
-        dst1 = dst0 + dur if dst0 > span.dst_start + 1e-4 else max(float(span.dst_end), dst0 + 0.04)
+        shifted = dst0 > span.dst_start + 1e-4
+        dst1 = dst0 + dur if shifted or solved <= 1e-4 else float(span.dst_end)
         if dst0 > prev + 0.02:
             spans.append(MapSpan("silence", float(span.src_start), float(span.src_start), prev, dst0))
         spans.append(MapSpan("speech", float(span.src_start), float(span.src_end), dst0, dst1))
