@@ -381,6 +381,78 @@ def bar_mark_times(
     return marks, span
 
 
+def bar_grid_for(orig: Path, target_sec: float) -> tuple[np.ndarray | None, str]:
+    """8-bar downbeats for stretch markers and the Rubber Band timemap.
+
+    None keeps the 30 s clock. Both engines use this ruler.
+    """
+    try:
+        from beat_phase import track_file
+
+        _beats, downbeats = track_file(Path(orig))
+    except Exception:  # noqa: BLE001 — a missing bar line keeps the 30 s clock
+        return None, "lag_follow=30s"
+    found = bar_mark_times(downbeats, float(target_sec))
+    if found is None:
+        return None, "lag_follow=30s"
+    marks, span = found
+    return marks, f"lag_follow=8bars; bar_span={span:.1f}s"
+
+
+MARKER_STEP_SEC = 0.015
+
+
+def _ruler_times(
+    grid_sec: np.ndarray | None,
+    target_sec: float,
+    spacing_sec: float,
+) -> np.ndarray:
+    """8-bar downbeats, or the 30 s clock when that bar line is missing."""
+    if grid_sec is not None:
+        grid = np.asarray(grid_sec, dtype=float)
+        grid = grid[np.isfinite(grid)]
+        grid = grid[(grid > 1.0) & (grid < float(target_sec) - 1.0)]
+        if len(grid):
+            return grid
+    spacing = max(30.0, float(spacing_sec))
+    marks = []
+    cursor = spacing
+    while cursor < float(target_sec) - spacing * 0.5:
+        marks.append(cursor)
+        cursor += spacing
+    return np.asarray(marks, dtype=float)
+
+
+def marks_where_lag_steps(
+    ruler: np.ndarray,
+    times: np.ndarray,
+    lags: np.ndarray,
+    step_sec: float = MARKER_STEP_SEC,
+) -> list[float]:
+    """Ruler ticks where the lag has moved by ``step_sec`` since the last marker.
+
+    Walk left to right. Audio left of a tick keeps the previous rate. The next
+    marker is the first later tick at which the lag has stepped.
+    """
+    ruler = np.asarray(ruler, dtype=float)
+    ruler = ruler[np.isfinite(ruler)]
+    times = np.asarray(times, dtype=float)
+    lags = np.asarray(lags, dtype=float)
+    if len(ruler) == 0 or len(times) < 2 or len(lags) != len(times):
+        return []
+    order = np.argsort(times)
+    times = times[order]
+    lags = lags[order]
+    pinned = float(np.interp(0.0, times, lags))
+    kept: list[float] = []
+    for t in ruler:
+        lag = float(np.interp(float(t), times, lags))
+        if abs(lag - pinned) >= float(step_sec):
+            kept.append(float(t))
+            pinned = lag
+    return kept
+
+
 def follow_lag_src_dst(
     times: np.ndarray,
     lags: np.ndarray,
@@ -395,11 +467,10 @@ def follow_lag_src_dst(
 ) -> tuple[np.ndarray, np.ndarray]:
     """Follow the measured lag instead of one straight rate.
 
-    src(t) = t - lag(t). The regular marks are ``grid_sec`` when that ruler
-    is passed (8-bar downbeats). Otherwise they fall every 30 s. A marker
-    every few seconds clicks; a marker only once a minute misses a slip
-    inside that minute. A step of 15 ms or more gets its own marker, left
-    where the lag jumped, so a section change is not ramped across the span.
+    src(t) = t - lag(t). The 8-bar line, or the 30 s clock, is only a ruler.
+    A marker is placed on the next tick after the lag has stepped by 15 ms.
+    A straight drift keeps one rate. The left of a marker stays on the
+    previous rate.
 
     The first lag sample is the center of a window. When the vocal starts
     late, that window sits after a block of silence. A marker only at the
@@ -432,24 +503,9 @@ def follow_lag_src_dst(
         lag = np.convolve(lag, kernel, mode="same")
 
     grid = None if grid_sec is None else np.asarray(grid_sec, dtype=float)
-    if grid is not None:
-        grid = grid[np.isfinite(grid)]
-        grid = grid[(grid > 1.0) & (grid < target_sec - 1.0)]
-        if jump_t and len(grid):
-            jumps = np.asarray(jump_t, dtype=float)
-            grid = np.asarray(
-                [float(g) for g in grid if float(np.min(np.abs(jumps - g))) >= 0.4],
-                dtype=float,
-            )
-    if grid is not None and len(grid):
-        dst_list = [0.0, *[float(x) for x in grid]]
-    else:
-        spacing = max(30.0, float(spacing_sec))
-        dst_list = [0.0]
-        cursor = spacing
-        while cursor < target_sec - spacing * 0.5:
-            dst_list.append(cursor)
-            cursor += spacing
+    ruler = _ruler_times(grid, target_sec, spacing_sec)
+    step_marks = marks_where_lag_steps(ruler, t, lag)
+    dst_list = [0.0, *step_marks]
     # No marker on the end of the song. That pin is a hard stop: source
     # audio after it is never played. The last rate holds, and the item
     # runs until the source has been heard.
@@ -463,8 +519,6 @@ def follow_lag_src_dst(
         dst_list.append(entrance)
     else:
         entrance = None
-    if jump_t:
-        dst_list.extend(x for x in jump_t if 1.0 < x < target_sec - 1.0)
     dst = np.unique(np.asarray(dst_list, dtype=float))
     lag_at = np.interp(dst, t, lag, left=float(lag[0]), right=float(lag[-1]))
     if entrance is not None:
@@ -547,13 +601,19 @@ def _build_timemap(
     sr: int,
     in_frames: int,
     out_frames: int,
+    grid_sec: np.ndarray | None = None,
 ) -> list[tuple[int, int]]:
-    """Map padded-input frames -> output frames using lag(t) on the output timeline."""
+    """Map padded-input frames -> output frames using lag(t) on the output timeline.
+
+    ``grid_sec`` is the 8-bar ruler. A marker is planted only where the lag
+    steps. A straight drift stays one rate. With no ruler, the 30 s clock
+    is that same ruler.
+    """
     t_end = out_frames / sr
     in_sec = max(0.0, (in_frames - 1) / sr) if sr else 0.0
-    if lag_line_rms(times, lags) > 0.02:
+    if grid_sec is not None or lag_line_rms(times, lags) > 0.02:
         src_s, dst_s = follow_lag_src_dst(
-            times, lags, target_sec=t_end, in_sec=in_sec
+            times, lags, target_sec=t_end, in_sec=in_sec, grid_sec=grid_sec
         )
     else:
         src_s, dst_s = stretch_src_dst(times, lags, target_sec=t_end, in_sec=in_sec)
@@ -596,6 +656,7 @@ def rubberband_timemap_stretch(
     times: np.ndarray,
     lags: np.ndarray,
     target_frames: int,
+    grid_sec: np.ndarray | None = None,
 ) -> np.ndarray:
     """Pitch-preserving warp via Rubber Band timemap. y may be multi-channel (N, C)."""
     exe = _ensure_rubberband_on_path()
@@ -614,7 +675,12 @@ def rubberband_timemap_stretch(
 
         sf.write(str(infile), y_out, sr, subtype="FLOAT")
         pairs = _build_timemap(
-            times, lags, sr=sr, in_frames=len(y_out), out_frames=target_frames
+            times,
+            lags,
+            sr=sr,
+            in_frames=len(y_out),
+            out_frames=target_frames,
+            grid_sec=grid_sec,
         )
         mapfile.write_text(
             "\n".join(f"{src} {tgt}" for src, tgt in pairs) + "\n", encoding="utf-8"
@@ -677,6 +743,7 @@ def write_warped_stem(
     target_sr: int,
     target_frames: int,
     target_channels: int,
+    grid_sec: np.ndarray | None = None,
 ) -> None:
     """Pad/trim then Rubber Band timemap-warp to original length (pitch preserved)."""
     y, file_sr = sf.read(str(src), always_2d=True, dtype="float32")
@@ -694,7 +761,12 @@ def write_warped_stem(
 
     if len(times) >= 2 and len(lags) >= 2:
         y = rubberband_timemap_stretch(
-            y, sr=target_sr, times=times, lags=lags, target_frames=target_frames
+            y,
+            sr=target_sr,
+            times=times,
+            lags=lags,
+            target_frames=target_frames,
+            grid_sec=grid_sec,
         )
     else:
         y = fit_len_2d(y, target_frames)
@@ -893,6 +965,8 @@ def warp_align_folder(
             shutil.copy2(aca_src, aca_dest)
 
         _emit_step(on_step, "align")
+        bar_grid, bar_note = bar_grid_for(orig, info.frames / info.samplerate)
+        result.notes += f"; {bar_note}"
         write_warped_stem(
             inst_src,
             folder / inst_src.name,
@@ -902,6 +976,7 @@ def warp_align_folder(
             target_sr=info.samplerate,
             target_frames=info.frames,
             target_channels=info.channels,
+            grid_sec=bar_grid,
         )
 
         _emit_step(on_step, "loudness")

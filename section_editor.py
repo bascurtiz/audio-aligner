@@ -23,6 +23,7 @@ from PyQt6.QtCore import QEvent, QPoint, QSize, QThread, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import (
     QAction,
     QColor,
+    QCursor,
     QFont,
     QIcon,
     QKeySequence,
@@ -34,17 +35,19 @@ from PyQt6.QtGui import (
 )
 from PyQt6.QtWidgets import (
     QApplication,
+    QButtonGroup,
     QCheckBox,
-    QComboBox,
     QHBoxLayout,
     QLabel,
     QMenu,
     QMessageBox,
     QPushButton,
+    QRadioButton,
     QScrollBar,
     QSizePolicy,
     QSlider,
     QToolButton,
+    QToolTip,
     QVBoxLayout,
     QWidget,
 )
@@ -59,7 +62,7 @@ from aca_gap_align import (
     peak_norm,
     rms_env,
 )
-from check_alignment import scan_folder
+from check_alignment import checkpoint_sample_times, scan_folder
 from window_chrome import (
     WIN_DEFAULT_H,
     WIN_DEFAULT_W,
@@ -90,6 +93,11 @@ ACCENT = "#7c5cff"
 DEMUCS = "#3d9e8f"
 ACA = "#a855f7"
 LANE_DEM = "#1a2424"
+STRETCH_CUE = "#e6b15c"
+SECTION_FILL = "#171920"
+SECTION_EDGE = "#3a3d4a"
+SECTION_DRAG_FILL = "#22242e"
+SECTION_DRAG_EDGE = "#8d93a8"
 
 
 class _EditorPlayback:
@@ -104,6 +112,7 @@ class _EditorPlayback:
         self.aca_gain = 1.0
         self.bed_kind = "vox"
         self.aca: np.ndarray | None = None
+        self.aca_src: np.ndarray | None = None
         self.vox: np.ndarray | None = None
         self.inst: np.ndarray | None = None
         self.dinst: np.ndarray | None = None
@@ -172,10 +181,13 @@ class _EditorPlayback:
                 self.inst = audio
             elif kind == "dinst":
                 self.dinst = audio
+            elif kind == "aca":
+                self.aca_src = audio
 
     def clear_buffers(self) -> None:
         with self._lock:
             self.aca = None
+            self.aca_src = None
             self.vox = None
             self.inst = None
             self.dinst = None
@@ -199,6 +211,8 @@ class _EditorPlayback:
                 if kind == "inst"
                 else self.dinst
                 if kind == "dinst"
+                else self.aca_src
+                if kind == "aca"
                 else None
             )
 
@@ -447,14 +461,40 @@ class Section:
     src0: float
     src1: float
     dst0: float
+    dst_dur: float | None = None
 
     @property
     def dur(self) -> float:
         return self.src1 - self.src0
 
     @property
+    def out_dur(self) -> float:
+        src = self.dur
+        if self.dst_dur is None or self.dst_dur <= 0:
+            return src
+        return float(self.dst_dur)
+
+    @property
     def dst1(self) -> float:
-        return self.dst0 + self.dur
+        return self.dst0 + self.out_dur
+
+    def snap(self) -> tuple:
+        return (
+            round(self.src0, 6),
+            round(self.src1, 6),
+            round(self.dst0, 6),
+            round(self.out_dur, 6),
+        )
+
+
+def section_from_snap(item: tuple) -> Section:
+    src0, src1, dst0 = float(item[0]), float(item[1]), float(item[2])
+    sec = Section(src0, src1, dst0)
+    if len(item) >= 4:
+        out = float(item[3])
+        if abs(out - (src1 - src0)) > 1e-4:
+            sec.dst_dur = out
+    return sec
 
 
 _MIN_SECTION_SEC = 0.4
@@ -500,10 +540,15 @@ def _more_sections(sections: list[Section], env: np.ndarray) -> list[Section] | 
         if split_at is None or cut is None:
             break
         sec = cur[split_at]
-        cur[split_at : split_at + 1] = [
-            Section(sec.src0, cut, sec.dst0),
-            Section(cut, sec.src1, sec.dst0 + (cut - sec.src0)),
-        ]
+        frac = (cut - sec.src0) / max(1e-6, sec.dur)
+        out_cut = sec.dst0 + frac * sec.out_dur
+        left = Section(sec.src0, cut, sec.dst0)
+        right = Section(cut, sec.src1, out_cut)
+        if abs((out_cut - sec.dst0) - left.dur) > 1e-4:
+            left.dst_dur = out_cut - sec.dst0
+        if abs((sec.dst1 - out_cut) - right.dur) > 1e-4:
+            right.dst_dur = sec.dst1 - out_cut
+        cur[split_at : split_at + 1] = [left, right]
     if len(cur) == len(sections):
         return None
     return cur
@@ -530,10 +575,14 @@ def _fewer_sections(sections: list[Section]) -> list[Section] | None:
         src0 = min(a.src0, b.src0)
         src1 = max(a.src1, b.src1)
         if a.src0 <= b.src0:
-            dst = a.dst0 + (src0 - a.src0)
+            dst = a.dst0
         else:
-            dst = b.dst0 + (src0 - b.src0)
-        cur[best : best + 2] = [Section(src0, src1, dst)]
+            dst = b.dst0
+        joined = Section(src0, src1, dst)
+        out = a.out_dur + b.out_dur
+        if abs(out - joined.dur) > 1e-4:
+            joined.dst_dur = out
+        cur[best : best + 2] = [joined]
     return cur
 
 
@@ -564,6 +613,53 @@ def _fade(chunk: np.ndarray, sr: int, fade_sec: float = 0.008) -> np.ndarray:
     return out
 
 
+def _clock_cursor() -> QCursor:
+    pix = QPixmap(22, 22)
+    pix.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(pix)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+    painter.setPen(QPen(QColor("#e6e8ef"), 1.4))
+    painter.setBrush(QColor("#1e1f26"))
+    painter.drawEllipse(1, 1, 18, 18)
+    painter.drawLine(10, 10, 10, 5)
+    painter.drawLine(10, 10, 14, 12)
+    painter.end()
+    return QCursor(pix, 10, 10)
+
+
+_CLOCK = None
+
+
+def _fit_chunk(chunk: np.ndarray, sr: int, n_out: int) -> np.ndarray:
+    """Pitch-preserving fit of one section to a new length."""
+    if n_out < 8 or abs(len(chunk) - n_out) <= 2:
+        return chunk
+    rate = float(np.clip(len(chunk) / float(n_out), 0.5, 2.0))
+    try:
+        from warp_align_fail_all import _ensure_rubberband_on_path
+
+        _ensure_rubberband_on_path()
+        import pyrubberband as pyrb
+
+        cols = []
+        for c in range(chunk.shape[1]):
+            stretched = pyrb.time_stretch(chunk[:, c].astype(np.float64), sr, rate)
+            cols.append(np.asarray(stretched, dtype=np.float32))
+        fitted = np.stack(cols, axis=1)
+    except Exception:  # noqa: BLE001 — a missing Rubber Band still previews the length
+        src_x = np.linspace(0.0, 1.0, len(chunk), endpoint=False)
+        dst_x = np.linspace(0.0, 1.0, n_out, endpoint=False)
+        fitted = np.stack(
+            [np.interp(dst_x, src_x, chunk[:, c]).astype(np.float32) for c in range(chunk.shape[1])],
+            axis=1,
+        )
+    if len(fitted) > n_out:
+        return fitted[:n_out]
+    if len(fitted) < n_out:
+        return np.pad(fitted, ((0, n_out - len(fitted)), (0, 0)))
+    return fitted
+
+
 def render_moved(
     audio: np.ndarray,
     sr: int,
@@ -583,6 +679,9 @@ def render_moved(
         chunk = _fade(audio[s0:s1], sr)
         if len(chunk) == 0:
             continue
+        n_out = max(1, int(round(sec.out_dur * sr)))
+        if abs(len(chunk) - n_out) > 2:
+            chunk = _fit_chunk(chunk, sr, n_out)
         d0 = int(round(sec.dst0 * sr))
         if d0 < 0:
             chunk = chunk[-d0:]
@@ -708,6 +807,106 @@ def _audible_end_sec(y: np.ndarray, sr: int, thr: float = 0.008) -> float:
     return min(len(mono) / sr, last + 0.12)
 
 
+def _clock_marks(duration: float, spacing: float = 30.0) -> list[float]:
+    """Output times of a fixed clock, including the start and not the end."""
+    duration = float(duration)
+    spacing = max(5.0, float(spacing))
+    marks = [0.0]
+    cursor = spacing
+    while cursor < duration - spacing * 0.5:
+        marks.append(float(cursor))
+        cursor += spacing
+    return marks
+
+
+def _cue_clock(seconds: float) -> str:
+    whole = max(0, int(round(float(seconds))))
+    minutes, secs = divmod(whole, 60)
+    return f"{minutes}:{secs:02d}"
+
+
+def _step_marker_times(
+    reference: np.ndarray,
+    query: np.ndarray,
+    file_sr: int,
+    ruler: list[float],
+) -> list[float]:
+    """Where a re-align would plant a warp marker, on the 8-bar ruler."""
+    if reference is None or query is None or len(ruler) < 1:
+        return []
+    from check_alignment import CHECKPOINT_CONFIRM_LAG_SEC, checkpoint_offsets
+    from warp_align_fail_all import marks_where_lag_steps
+
+    sr = 22050
+    ref = reference.mean(axis=1) if reference.ndim == 2 else reference
+    qry = query.mean(axis=1) if query.ndim == 2 else query
+    ref = _to_sr(np.asarray(ref, dtype=np.float32), file_sr, sr)
+    qry = _to_sr(np.asarray(qry, dtype=np.float32), file_sr, sr)
+    starts = np.array([max(0.0, float(t) - 4.0) for t in ruler], dtype=float)
+    points = checkpoint_offsets(
+        ref, qry, sr, at_times=starts, confirm_sec=CHECKPOINT_CONFIRM_LAG_SEC
+    )
+    if len(points) < 2:
+        return []
+    times = np.array([p[0] for p in points], dtype=float)
+    lags = np.array([p[1] for p in points], dtype=float)
+    return marks_where_lag_steps(np.asarray(ruler, dtype=float), times, lags)
+
+
+def _window_at(y: np.ndarray, sr: int, center: float, half: float = 5.0) -> np.ndarray:
+    mono = y.mean(axis=1) if getattr(y, "ndim", 1) == 2 else y
+    mono = np.asarray(mono, dtype=np.float32)
+    n = max(1, int(round(half * 2 * sr)))
+    out = np.zeros(n, dtype=np.float32)
+    i0 = int(round((center - half) * sr))
+    dst = 0
+    if i0 < 0:
+        dst = -i0
+        i0 = 0
+    i1 = min(len(mono), i0 + (n - dst))
+    take = i1 - i0
+    if take > 0:
+        out[dst : dst + take] = mono[i0:i1]
+    return out
+
+
+def _section_lag(reference, query, file_sr: int, out_t: float, sec: Section) -> float | None:
+    """Residual lag of one section against its reference. None when unmeasured."""
+    if reference is None or query is None:
+        return None
+    from check_alignment import CHECKPOINT_CONFIRM_LAG_SEC, checkpoint_offsets
+
+    sr = 22050
+    src_t = sec.src0 + (float(out_t) - sec.dst0) * (sec.dur / max(1e-6, sec.out_dur))
+    ref = _to_sr(_window_at(reference, file_sr, float(out_t)), file_sr, sr)
+    qry = _to_sr(_window_at(query, file_sr, src_t), file_sr, sr)
+    points = checkpoint_offsets(
+        ref, qry, sr, at_times=np.array([1.0]), confirm_sec=CHECKPOINT_CONFIRM_LAG_SEC
+    )
+    if not points:
+        return None
+    _t, lag, railed = points[0]
+    if railed:
+        return None
+    return float(lag)
+
+
+def _warp_cue_times(original: Path, duration: float) -> tuple[list[float], bool]:
+    """Shared 8-bar ruler, and whether that bar line was used.
+
+    A missing bar line puts the ticks on the 30 s clock.
+    """
+    marks, _note = checkpoint_sample_times(original)
+    if marks is None:
+        return _clock_marks(duration, 30.0), False
+    shared = [0.0]
+    for t in np.asarray(marks, dtype=float):
+        t = float(t)
+        if 1.0 < t < float(duration) - 1.0:
+            shared.append(t)
+    return shared, True
+
+
 def _load_song(folder: Path) -> dict:
     aca_path, inst_path, orig_path, notes = scan_folder(folder)
     if not aca_path or not orig_path:
@@ -795,6 +994,9 @@ def _load_song(folder: Path) -> dict:
             if heard > tail.src1 + 0.02:
                 inst_sections[-1] = Section(tail.src0, min(heard, duration), tail.dst0)
 
+    bar_times, cue_on_bars = _warp_cue_times(orig_path, duration)
+    aca_markers = _step_marker_times(vox, aca, sr, bar_times)
+    inst_markers = _step_marker_times(dinst, inst, sr, bar_times) if inst is not None else []
     return {
         "folder": folder,
         "aca_path": aca_path,
@@ -814,6 +1016,10 @@ def _load_song(folder: Path) -> dict:
         "demucs_inst_peaks": _peaks(dinst, sr),
         "aca_v": aca_v,
         "sections": sections,
+        "bar_times": bar_times,
+        "cue_on_bars": cue_on_bars,
+        "aca_markers": aca_markers,
+        "inst_markers": inst_markers,
     }
 
 
@@ -845,12 +1051,23 @@ class Timeline(QWidget):
         self.sections: list[Section] = []
         self.playhead = 0.0
         self.show_alignment = True
+        self.show_bars = True
+        self.bar_times: list[float] = []
+        self.cue_on_bars = True
+        self._cue_tip = ""
         self._drag: int | None = None
         self._drag_grab = 0.0
         self._drag_origin = 0.0
         self._pan: float | None = None
         self._pan_x = 0.0
         self._pan_start = 0.0
+        self._hover_x: float | None = None
+        self._drag_slip = False
+        self._stretch: tuple[int, str] | None = None
+        self._hover_edge: tuple[int, str] | None = None
+        self.marker_times: list[float] = []
+        self._aca_markers: list[float] = []
+        self._inst_markers: list[float] = []
         self.solo = {"demucs": False, "output": False}
         self.mute = {"demucs": False, "output": False}
         self._demucs_solo = self._make_sm("S", "Solo Demucs vocal (1)")
@@ -875,6 +1092,10 @@ class Timeline(QWidget):
         *,
         inst_ref_peaks: np.ndarray | None = None,
         inst_out_peaks: np.ndarray | None = None,
+        bar_times: list[float] | None = None,
+        cue_on_bars: bool = True,
+        aca_markers: list[float] | None = None,
+        inst_markers: list[float] | None = None,
     ) -> None:
         self.duration = max(duration, 0.1)
         self.view_span = self.duration
@@ -883,6 +1104,10 @@ class Timeline(QWidget):
         self._aca_out_peaks = aca_peaks
         self._inst_ref_peaks = inst_ref_peaks
         self._inst_out_peaks = inst_out_peaks
+        self.bar_times = [float(t) for t in (bar_times or [])]
+        self.cue_on_bars = bool(cue_on_bars)
+        self._aca_markers = [float(t) for t in (aca_markers or [])]
+        self._inst_markers = [float(t) for t in (inst_markers or [])]
         self.sections = list(sections)
         self.playhead = 0.0
         self.set_stem("aca")
@@ -897,6 +1122,7 @@ class Timeline(QWidget):
             self._demucs_mute.setToolTip("Mute Demucs instrumental (Shift+1)")
             self._output_solo.setToolTip("Solo instrumental output (2)")
             self._output_mute.setToolTip("Mute instrumental output (Shift+2)")
+            self.marker_times = self._inst_markers
         else:
             self.vox_peaks = self._aca_ref_peaks
             self.aca_peaks = self._aca_out_peaks
@@ -904,6 +1130,7 @@ class Timeline(QWidget):
             self._demucs_mute.setToolTip("Mute Demucs vocal (Shift+1)")
             self._output_solo.setToolTip("Solo output acapella (2)")
             self._output_mute.setToolTip("Mute output acapella (Shift+2)")
+            self.marker_times = self._aca_markers
         self.update()
 
     def editing(self) -> bool:
@@ -1010,7 +1237,74 @@ class Timeline(QWidget):
 
     def _clamp_dst(self, index: int, dst: float) -> float:
         sec = self.sections[index]
-        return max(0.0, min(self.duration - sec.dur, dst))
+        return max(0.0, min(self.duration - sec.out_dur, dst))
+
+    def _split_partner(self, index: int, side: str) -> tuple[int, str] | None:
+        """The other section that meets this edge at a split."""
+        sec = self.sections[index]
+        t = sec.dst1 if side == "right" else sec.dst0
+        want = "left" if side == "right" else "right"
+        for j, other in enumerate(self.sections):
+            if j == index:
+                continue
+            other_t = other.dst0 if want == "left" else other.dst1
+            if abs(other_t - t) <= 0.02:
+                return (j, want)
+        return None
+
+    def _hit_edge(self, x: float, y: float) -> tuple[int, str] | None:
+        if not self.editing():
+            return None
+        _r, _d, aca_top, aca_bot = self._lanes()
+        if y < aca_top or y > aca_bot:
+            return None
+        near: list[tuple[float, int, str, float]] = []
+        for i, sec in enumerate(self.sections):
+            for side, edge in (("left", sec.dst0), ("right", sec.dst1)):
+                dx = abs(x - self._t_to_x(edge))
+                if dx <= 8.0:
+                    near.append((dx, i, side, edge))
+        if not near:
+            return None
+        _dx, index, side, edge = min(near)
+        partner = self._split_partner(index, side)
+        if partner is None:
+            return (index, side)
+        split_x = self._t_to_x(edge)
+        if x > split_x:
+            return (index, "left") if side == "left" else partner
+        return (index, "right") if side == "right" else partner
+
+    def _clock(self) -> QCursor:
+        global _CLOCK
+        if _CLOCK is None:
+            _CLOCK = _clock_cursor()
+        return _CLOCK
+
+    def _apply_stretch(self, x: float) -> None:
+        if self._stretch is None:
+            return
+        idx, side = self._stretch
+        sec = self.sections[idx]
+        t = self._x_to_t(x)
+        src = max(0.05, sec.dur)
+        if side == "right":
+            raw = t - self._stretch_dst0
+            dur = min(max(raw, src / 2.0), src * 2.0)
+            dur = min(dur, max(0.05, self.duration - sec.dst0))
+            sec.dst_dur = None if abs(dur - src) < 1e-3 else dur
+        else:
+            right = self._stretch_dst0 + self._stretch_dur
+            raw = right - t
+            dur = min(max(raw, src / 2.0), src * 2.0)
+            dst0 = right - dur
+            if dst0 < 0.0:
+                dur += dst0
+                dst0 = 0.0
+            sec.dst0 = dst0
+            sec.dst_dur = None if abs(dur - src) < 1e-3 else dur
+        self.changed.emit()
+        self.update()
 
     def wheelEvent(self, event) -> None:  # noqa: N802
         t = self._x_to_t(float(event.position().x()))
@@ -1029,6 +1323,16 @@ class Timeline(QWidget):
             event.button() == Qt.MouseButton.LeftButton
             and event.modifiers() & Qt.KeyboardModifier.AltModifier
         ):
+            edge = self._hit_edge(x, y) if event.button() == Qt.MouseButton.LeftButton else None
+            if edge is not None:
+                idx, side = edge
+                sec = self.sections[idx]
+                self.editBegan.emit()
+                self._stretch = edge
+                self._stretch_dst0 = sec.dst0
+                self._stretch_dur = sec.out_dur
+                self.setCursor(self._clock())
+                return
             self._pan = self.view_start
             self._pan_x = x
             self._pan_start = self.view_start
@@ -1059,13 +1363,25 @@ class Timeline(QWidget):
         if hit is not None:
             self.editBegan.emit()
             self._drag = hit
-            self._drag_origin = self.sections[hit].dst0
-            self._drag_grab = self._x_to_t(x) - self.sections[hit].dst0
+            self._drag_slip = bool(event.modifiers() & Qt.KeyboardModifier.ShiftModifier)
+            sec = self.sections[hit]
+            if self._drag_slip:
+                self._drag_origin = sec.src0
+                self._drag_span = sec.dur
+                self._drag_grab = self._x_to_t(x)
+            else:
+                self._drag_origin = sec.dst0
+                self._drag_grab = self._x_to_t(x) - sec.dst0
             return
         self.seeked.emit(max(0.0, min(self.duration, self._x_to_t(x))))
 
     def mouseMoveEvent(self, event) -> None:  # noqa: N802
         x = float(event.position().x())
+        self._set_hover_x(x)
+        alt = bool(event.modifiers() & Qt.KeyboardModifier.AltModifier)
+        if self._stretch is not None:
+            self._apply_stretch(x)
+            return
         if self._pan is not None:
             dx = x - self._pan_x
             self.view_start = min(
@@ -1076,26 +1392,75 @@ class Timeline(QWidget):
             self.update()
             return
         if self._drag is None:
-            hit = self._hit_section(x, float(event.position().y()))
-            self.setCursor(
-                Qt.CursorShape.SizeHorCursor if hit is not None else Qt.CursorShape.ArrowCursor
-            )
+            self._hover_cue(event)
+            edge = self._hit_edge(x, float(event.position().y())) if alt else None
+            self._hover_edge = edge
+            if edge is not None:
+                self.setCursor(self._clock())
+            else:
+                hit = self._hit_section(x, float(event.position().y()))
+                self.setCursor(
+                    Qt.CursorShape.SizeHorCursor if hit is not None else Qt.CursorShape.ArrowCursor
+                )
+            if alt:
+                self.update()
             return
         t = self._x_to_t(x)
-        delta = (t - self._drag_grab) - self._drag_origin
-        if event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
-            delta *= 0.25
-        self.sections[self._drag].dst0 = self._clamp_dst(self._drag, self._drag_origin + delta)
+        sec = self.sections[self._drag]
+        if self._drag_slip:
+            delta = t - self._drag_grab
+            span = self._drag_span
+            src0 = self._drag_origin - delta
+            src0 = max(0.0, min(src0, max(0.0, self.duration - span)))
+            sec.src0 = src0
+            sec.src1 = src0 + span
+        else:
+            delta = (t - self._drag_grab) - self._drag_origin
+            sec.dst0 = self._clamp_dst(self._drag, self._drag_origin + delta)
         self.changed.emit()
         self.update()
 
     def mouseReleaseEvent(self, event) -> None:  # noqa: N802
-        dragged = self._drag is not None
+        dragged = self._drag is not None or self._stretch is not None
         self._drag = None
+        self._drag_slip = False
+        self._stretch = None
         self._pan = None
+        alt = bool(event.modifiers() & Qt.KeyboardModifier.AltModifier)
+        x = float(event.position().x())
+        y = float(event.position().y())
+        self._hover_edge = self._hit_edge(x, y) if alt else None
         self.update()
         if dragged:
             self.dragFinished.emit()
+
+    def leaveEvent(self, _event) -> None:  # noqa: N802
+        self._hover_x = None
+        self._cue_tip = ""
+        QToolTip.hideText()
+        self._hover_edge = None
+        if self._stretch is None:
+            self.setCursor(Qt.CursorShape.ArrowCursor)
+        self.update()
+
+    def keyPressEvent(self, event) -> None:  # noqa: N802
+        if event.key() == Qt.Key.Key_Alt:
+            self.update()
+        super().keyPressEvent(event)
+
+    def keyReleaseEvent(self, event) -> None:  # noqa: N802
+        if event.key() == Qt.Key.Key_Alt and self._stretch is None:
+            self._hover_edge = None
+            self.setCursor(Qt.CursorShape.ArrowCursor)
+            self.update()
+        super().keyReleaseEvent(event)
+
+    def _set_hover_x(self, x: float) -> None:
+        nxt = x if x >= GUTTER else None
+        if nxt == self._hover_x:
+            return
+        self._hover_x = nxt
+        self.update()
 
     def paintEvent(self, _event) -> None:  # noqa: N802
         p = QPainter(self)
@@ -1116,10 +1481,16 @@ class Timeline(QWidget):
         if self.show_alignment:
             self._draw_alignment(p, ruler, h)
         self._draw_ruler(p, ruler)
+        self._draw_warp_cues(p, ruler, h)
+        if self._hover_x is not None:
+            hx = int(round(self._hover_x))
+            if GUTTER <= hx <= w:
+                p.setPen(QPen(QColor("#6a7080"), 1))
+                p.drawLine(hx, ruler, hx, h)
         if 0 <= self.playhead <= self.duration:
             x = int(self._t_to_x(self.playhead))
             if GUTTER <= x <= w:
-                p.setPen(QPen(QColor("#f2f4ff"), 1))
+                p.setPen(QPen(QColor("#d0d4de"), 1))
                 p.drawLine(x, ruler, x, h)
         p.setPen(QColor(DIM))
         p.setFont(QFont("Segoe UI", 8))
@@ -1153,6 +1524,66 @@ class Timeline(QWidget):
                 p.drawLine(x, ruler_h, x, bottom)
             t += step
 
+    def _draw_warp_cues(self, p: QPainter, ruler_h: int, bottom: int) -> None:
+        end = self.view_start + self.view_span
+        tick = QColor(STRETCH_CUE)
+        tick.setAlpha(90)
+        p.setPen(QPen(tick, 1))
+        for t in self.bar_times:
+            if t < self.view_start - 0.01 or t > end + 0.01:
+                continue
+            x = int(round(self._t_to_x(float(t))))
+            if GUTTER <= x <= self.width():
+                p.drawLine(x, ruler_h - 6, x, ruler_h)
+        if not self.show_bars or not self.marker_times:
+            return
+        line = QColor(STRETCH_CUE)
+        line.setAlpha(72)
+        pen = QPen(line, 1)
+        for t in self.marker_times:
+            if t < self.view_start - 0.01 or t > end + 0.01:
+                continue
+            x = int(round(self._t_to_x(float(t))))
+            if x < GUTTER or x > self.width():
+                continue
+            p.setPen(pen)
+            p.drawLine(x, ruler_h, x, bottom)
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QColor(STRETCH_CUE))
+            p.drawPolygon(
+                QPolygon([QPoint(x, ruler_h), QPoint(x - 4, ruler_h - 7), QPoint(x + 4, ruler_h - 7)])
+            )
+        p.setBrush(Qt.BrushStyle.NoBrush)
+
+    def _hover_cue(self, event) -> None:
+        tip = self._cue_tip_at(float(event.position().x()))
+        if tip == self._cue_tip:
+            return
+        self._cue_tip = tip
+        if tip:
+            QToolTip.showText(event.globalPosition().toPoint(), tip, self)
+        else:
+            QToolTip.hideText()
+
+    def _cue_tip_at(self, x: float) -> str:
+        if not self.show_bars:
+            return ""
+        hit = self._near_cue(self.marker_times, x)
+        if hit is None:
+            return ""
+        clock = _cue_clock(hit)
+        return f"Warp marker at {clock}."
+
+    def _near_cue(self, times: list[float], x: float) -> float | None:
+        best: float | None = None
+        best_dx = 7.0
+        for t in times:
+            dx = abs(self._t_to_x(float(t)) - x)
+            if dx <= best_dx:
+                best = float(t)
+                best_dx = dx
+        return best
+
     def _draw_ruler(self, p: QPainter, ruler_h: int) -> None:
         p.setPen(QColor("#3a3d4d"))
         p.drawLine(GUTTER, ruler_h, self.width(), ruler_h)
@@ -1179,7 +1610,7 @@ class Timeline(QWidget):
         top: int,
         bot: int,
         color: QColor,
-        src_dst: tuple[float, float, float] | None,
+        src_dst: tuple[float, float, float, float] | None,
     ) -> None:
         if peaks is None or len(peaks) == 0:
             return
@@ -1197,12 +1628,13 @@ class Timeline(QWidget):
                 lo, hi = float(peaks[i, 0]), float(peaks[i, 1])
                 p.drawLine(x, int(mid - hi * amp), x, int(mid - lo * amp))
             return
-        src0, src1, dst0 = src_dst
+        src0, src1, dst0, out_dur = src_dst
+        scale = out_dur / max(1e-6, src1 - src0)
         i0 = max(0, int(src0 * PEAK_HZ))
         i1 = min(n, int(src1 * PEAK_HZ) + 1)
         for i in range(i0, i1):
             src_t = i / PEAK_HZ
-            dst_t = dst0 + (src_t - src0)
+            dst_t = dst0 + (src_t - src0) * scale
             if dst_t < self.view_start or dst_t > self.view_start + self.view_span:
                 continue
             x = int(self._t_to_x(dst_t))
@@ -1210,6 +1642,7 @@ class Timeline(QWidget):
             p.drawLine(x, int(mid - hi * amp), x, int(mid - lo * amp))
 
     def _draw_sections(self, p: QPainter, top: int, bot: int) -> None:
+        hot = self._stretch if self._stretch is not None else self._hover_edge
         for i, sec in enumerate(self.sections):
             x0 = self._t_to_x(sec.dst0)
             x1 = self._t_to_x(sec.dst1)
@@ -1217,10 +1650,15 @@ class Timeline(QWidget):
                 continue
             muted = not self.audible("output")
             wave = _dim_wave(ACA, PANEL, dim=muted)
-            rect_color = QColor(ACCENT)
-            rect_color.setAlpha(18 if muted else (50 if i != self._drag else 90))
-            p.fillRect(int(x0), top + 4, max(1, int(x1 - x0)), bot - top - 8, rect_color)
-            p.setPen(QPen(wave, 1))
+            held = i == self._drag or (hot is not None and hot[0] == i)
+            fill = QColor(SECTION_DRAG_FILL if held else SECTION_FILL)
+            edge = QColor(SECTION_EDGE)
+            if muted:
+                edge.setAlpha(90)
+            elif held:
+                edge = QColor(SECTION_DRAG_EDGE)
+            p.fillRect(int(x0), top + 4, max(1, int(x1 - x0)), bot - top - 8, fill)
+            p.setPen(QPen(edge, 1))
             p.drawRect(int(x0), top + 4, max(1, int(x1 - x0)), bot - top - 8)
             self._draw_wave(
                 p,
@@ -1228,8 +1666,24 @@ class Timeline(QWidget):
                 top + 6,
                 bot - 4,
                 wave,
-                (sec.src0, sec.src1, sec.dst0),
+                (sec.src0, sec.src1, sec.dst0, sec.out_dur),
             )
+        if hot is None or not (0 <= hot[0] < len(self.sections)):
+            return
+        sec = self.sections[hot[0]]
+        where = "top" if hot[1] == "right" else "bottom"
+        ex = sec.dst1 if hot[1] == "right" else sec.dst0
+        self._draw_clock(p, self._t_to_x(ex), top, bot, where)
+
+    def _draw_clock(self, p: QPainter, x: float, top: int, bot: int, where: str) -> None:
+        cx = int(x)
+        cy = top + 10 if where == "top" else bot - 10
+        r = 6
+        p.setPen(QPen(QColor("#e6e8ef"), 1.2))
+        p.setBrush(QColor("#1e1f26"))
+        p.drawEllipse(cx - r, cy - r, r * 2, r * 2)
+        p.drawLine(cx, cy, cx, cy - 4)
+        p.drawLine(cx, cy, cx + 3, cy + 2)
 
 
 class SectionEditor(QWidget):
@@ -1271,12 +1725,10 @@ class SectionEditor(QWidget):
             f"QPushButton:hover {{ background: #36384A; }}"
             f"QPushButton:pressed {{ background: #2A2C38; }}"
             f"QPushButton:disabled {{ color: #7a8199; }}"
-            f"QComboBox {{ background: {CHIP_BG}; color: {FG}; border: 1px solid {BORDER}; "
-            f"border-radius: 6px; padding: 4px 10px; min-height: 26px; }}"
-            f"QComboBox:hover {{ background: #36384A; }}"
-            f"QComboBox::drop-down {{ border: none; width: 18px; }}"
-            f"QComboBox QAbstractItemView {{ background: {PANEL}; color: {FG}; "
-            f"selection-background-color: #36384A; outline: none; }}"
+            f"QRadioButton {{ color: {FG}; background: transparent; spacing: 8px; }}"
+            f"QRadioButton::indicator {{ width: 14px; height: 14px; border-radius: 7px; "
+            f"border: 1px solid {BORDER}; background: {CHIP_BG}; }}"
+            f"QRadioButton::indicator:checked {{ background: {ACCENT}; border: 1px solid {ACCENT}; }}"
             f"QCheckBox {{ color: {FG}; spacing: 8px; background: transparent; }}"
             f"QCheckBox::indicator {{ width: 16px; height: 16px; border-radius: 4px; "
             f"border: 1px solid {BORDER}; background: {CHIP_BG}; }}"
@@ -1302,6 +1754,7 @@ class SectionEditor(QWidget):
         self._vox_st: np.ndarray | None = None
         self._inst_st: np.ndarray | None = None
         self._dinst_st: np.ndarray | None = None
+        self._aca_st: np.ndarray | None = None
         self._play_sr = 0
         self._play = _EditorPlayback()
         self._cue: float | None = None
@@ -1319,15 +1772,22 @@ class SectionEditor(QWidget):
         self.scroll = QScrollBar(Qt.Orientation.Horizontal)
         self.scroll.valueChanged.connect(self._on_scroll)
 
-        self.stem_box = QComboBox()
-        self.stem_box.addItem("Acapella", "aca")
-        self.stem_box.addItem("Instrumental", "inst")
-        self.stem_box.setToolTip(
-            "Acapella shows the Demucs vocal and the acapella.\n"
-            "Instrumental shows the Demucs instrumental and its output.\n"
-            "Apply writes the stem you are looking at."
+        self._stem_group = QButtonGroup(self)
+        self._stem_group.setExclusive(True)
+        self.aca_radio = QRadioButton("Acapella")
+        self.inst_radio = QRadioButton("Instrumental")
+        self.aca_radio.setChecked(True)
+        self._stem_group.addButton(self.aca_radio, 0)
+        self._stem_group.addButton(self.inst_radio, 1)
+        self.aca_radio.setToolTip(
+            "Shows the Demucs vocal and the acapella.\n"
+            "Apply writes this stem."
         )
-        self.stem_box.currentIndexChanged.connect(self._on_stem_changed)
+        self.inst_radio.setToolTip(
+            "Shows the Demucs instrumental and its output.\n"
+            "Apply writes this stem."
+        )
+        self._stem_group.idClicked.connect(self._on_stem_changed)
         self.status = QLabel("Loading Demucs vocal and acapella…")
         self.status.setObjectName("StatusLabel")
         self.status.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -1346,6 +1806,15 @@ class SectionEditor(QWidget):
             "Drag a section and the wave moves against them."
         )
         self.align_lines.toggled.connect(self._toggle_alignment)
+        self.bar_lines = QCheckBox("Warp markers")
+        self.bar_lines.setChecked(True)
+        self.bar_lines.setStyleSheet(f"QCheckBox {{ color: {STRETCH_CUE}; background: transparent; }}")
+        self.bar_lines.setToolTip(
+            "Shows a marker where the lag has stepped.\n"
+            "Faint ticks on the ruler are every 8 bars.\n"
+            "A straight song has no marker."
+        )
+        self.bar_lines.toggled.connect(self._toggle_bars)
         self.timeline.mixChanged.connect(self._sync_gains)
         self.reset_btn = QPushButton("Reset")
         self.reset_btn.setEnabled(False)
@@ -1360,6 +1829,14 @@ class SectionEditor(QWidget):
         self.more_btn.setEnabled(False)
         self.more_btn.setToolTip("Split the longest phrases into shorter sections.")
         self.more_btn.clicked.connect(lambda: self._retarget_sections(1))
+        self.halfway_btn = QPushButton("Halfway")
+        self.halfway_btn.setEnabled(False)
+        self.halfway_btn.setToolTip(
+            "Pulls the section under the playhead halfway toward the reference.\n"
+            "Only a hit that is already close is moved.\n"
+            "A slip of a beat is left where it is."
+        )
+        self.halfway_btn.clicked.connect(self._pull_halfway)
         self.apply_btn = QPushButton("Apply")
         self.apply_btn.setEnabled(False)
         self.apply_btn.setToolTip(
@@ -1369,13 +1846,14 @@ class SectionEditor(QWidget):
         self.apply_btn.clicked.connect(self._apply)
 
         row = QHBoxLayout()
-        row.addWidget(self.stem_box)
         row.addWidget(self.with_demucs)
         row.addWidget(self.align_lines)
+        row.addWidget(self.bar_lines)
         row.addWidget(self.status, 1)
         row.addWidget(self.sections_lbl)
         row.addWidget(self.fewer_btn)
         row.addWidget(self.more_btn)
+        row.addWidget(self.halfway_btn)
         row.addWidget(self.reset_btn)
         row.addWidget(self.apply_btn)
 
@@ -1397,11 +1875,15 @@ class SectionEditor(QWidget):
         self.folder_lbl.setObjectName("FolderChip")
         self.folder_lbl.setToolTip("Open folder in Explorer")
         self.folder_lbl.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.folder_lbl.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Preferred)
         self.folder_lbl.installEventFilter(self)
         header = QHBoxLayout()
         header.setContentsMargins(0, 0, 0, 0)
         header.setSpacing(8)
         header.addWidget(self.folder_lbl, 0)
+        header.addSpacing(14)
+        header.addWidget(self.aca_radio)
+        header.addWidget(self.inst_radio)
         header.addStretch(1)
         self.time_lbl = QLabel("00:00:000")
         self.time_lbl.setStyleSheet(
@@ -1450,8 +1932,12 @@ class SectionEditor(QWidget):
         for widget in (
             self.fewer_btn,
             self.more_btn,
-            self.stem_box,
+            self.halfway_btn,
+            self.aca_radio,
+            self.inst_radio,
             self.with_demucs,
+            self.align_lines,
+            self.bar_lines,
             self.reset_btn,
             self.apply_btn,
             self.scroll,
@@ -1532,7 +2018,7 @@ class SectionEditor(QWidget):
         _sc("Shift+2", lambda: self.timeline.toggle_mute("output"), repeat=False)
 
     def _section_snapshot(self) -> tuple:
-        return tuple((s.src0, s.src1, s.dst0) for s in self.timeline.sections)
+        return tuple(s.snap() for s in self.timeline.sections)
 
     def _sections_dirty(self) -> bool:
         if self._data is None:
@@ -1559,6 +2045,43 @@ class SectionEditor(QWidget):
         n = len(self.timeline.sections)
         self.fewer_btn.setEnabled(ready and n > 1)
         self.more_btn.setEnabled(ready and n > 0)
+        self.halfway_btn.setEnabled(ready and n > 0)
+
+    def _pull_halfway(self) -> None:
+        if self._busy or self._data is None or not self.timeline.editing():
+            return
+        t = float(self.timeline.playhead)
+        sections = self.timeline.sections
+        idx = next((i for i, sec in enumerate(sections) if sec.dst0 <= t <= sec.dst1), None)
+        if idx is None:
+            self.status.setText("Put the playhead inside a section, then pull it halfway.")
+            return
+        data = self._data
+        if self.timeline.stem == "inst":
+            ref, qry = data.get("demucs_inst"), data.get("inst")
+        else:
+            ref, qry = data.get("vox"), data.get("aca")
+        lag = _section_lag(ref, qry, int(data["sr"]), t, sections[idx])
+        if lag is None or abs(lag) > 0.040:
+            self.status.setText("That hit is a beat away. Left it.")
+            return
+        sec = sections[idx]
+        span = sec.dur
+        src0 = sec.src0 - 0.5 * float(lag)
+        src0 = max(0.0, min(src0, max(0.0, float(data["duration"]) - span)))
+        if abs(src0 - sec.src0) < 0.0005:
+            self.status.setText("That section is already on the reference.")
+            return
+        self._push_undo()
+        sec.src0 = src0
+        sec.src1 = src0 + span
+        self._invalidate_aca_play()
+        if self._is_playing():
+            self._ensure_aca_play()
+        self.timeline.update()
+        self._sync_edit_buttons()
+        ms = abs(0.5 * float(lag)) * 1000.0
+        self.status.setText(f"Pulled the section {ms:.0f} ms toward the reference.")
 
     def _note_edit(self) -> None:
         self._pending_undo = self._section_snapshot()
@@ -1602,7 +2125,7 @@ class SectionEditor(QWidget):
         self.status.setText(f"{len(nxt)} {word}.")
 
     def _restore_sections(self, snap: tuple) -> None:
-        self.timeline.sections = [Section(a, b, d) for a, b, d in snap]
+        self.timeline.sections = [section_from_snap(item) for item in snap]
         self._invalidate_aca_play()
         if self._is_playing() and self._data is not None:
             self._ensure_aca_play()
@@ -1624,6 +2147,7 @@ class SectionEditor(QWidget):
         self._vox_st = None
         self._inst_st = None
         self._dinst_st = None
+        self._aca_st = None
         self._play.clear_buffers()
         self._data = data
         self._play.sr = int(data["sr"])
@@ -1637,7 +2161,7 @@ class SectionEditor(QWidget):
         self._section_bank = {"aca": aca_sections, "inst": inst_sections}
 
         def _snap(sections: list[Section]) -> tuple:
-            return tuple((s.src0, s.src1, s.dst0) for s in sections)
+            return tuple(s.snap() for s in sections)
 
         self._initial = {"aca": _snap(aca_sections), "inst": _snap(inst_sections)}
         self.timeline.set_song(
@@ -1647,10 +2171,12 @@ class SectionEditor(QWidget):
             data["sections"],
             inst_ref_peaks=data.get("demucs_inst_peaks"),
             inst_out_peaks=data.get("inst_peaks"),
+            bar_times=list(data.get("bar_times") or []),
+            cue_on_bars=bool(data.get("cue_on_bars", True)),
+            aca_markers=list(data.get("aca_markers") or []),
+            inst_markers=list(data.get("inst_markers") or []),
         )
-        self.stem_box.blockSignals(True)
-        self.stem_box.setCurrentIndex(0)
-        self.stem_box.blockSignals(False)
+        self._set_stem_choice("aca")
         self._apply_pair_chrome()
         self._sync_scroll()
         self._sync_transport()
@@ -1667,9 +2193,26 @@ class SectionEditor(QWidget):
         self.status.setText(message)
         QMessageBox.warning(self, "Could not open editor", message)
 
+    def keyPressEvent(self, event) -> None:  # noqa: N802
+        if event.key() == Qt.Key.Key_Alt:
+            self.timeline.update()
+        super().keyPressEvent(event)
+
+    def keyReleaseEvent(self, event) -> None:  # noqa: N802
+        if event.key() == Qt.Key.Key_Alt:
+            self.timeline.keyReleaseEvent(event)
+            return
+        super().keyReleaseEvent(event)
+
     def _on_timeline_changed(self) -> None:
         self._sync_scroll()
         self._sync_edit_buttons()
+        if self.timeline._stretch is not None:
+            idx = self.timeline._stretch[0]
+            sec = self.timeline.sections[idx]
+            pct = 100.0 * sec.dur / max(1e-6, sec.out_dur)
+            self.status.setText(f"Section {idx + 1} at {pct:.0f}% speed.")
+            return
         if self.timeline._drag is not None:
             sec = self.timeline.sections[self.timeline._drag]
             m, s = divmod(sec.dst0, 60)
@@ -1689,14 +2232,18 @@ class SectionEditor(QWidget):
         self.timeline.view_start = value / 1000.0
         self.timeline.update()
 
-    def _on_stem_changed(self) -> None:
-        stem = self.stem_box.currentData() or "aca"
+    def _set_stem_choice(self, stem: str) -> None:
+        button = self.inst_radio if stem == "inst" else self.aca_radio
+        self._stem_group.blockSignals(True)
+        button.setChecked(True)
+        self._stem_group.blockSignals(False)
+
+    def _on_stem_changed(self, _checked_id: int = 0) -> None:
+        stem = "inst" if self._stem_group.checkedId() == 1 else "aca"
         if self._data is None:
             return
         if stem == "inst" and self._data.get("inst") is None:
-            self.stem_box.blockSignals(True)
-            self.stem_box.setCurrentIndex(0)
-            self.stem_box.blockSignals(False)
+            self._set_stem_choice("aca")
             self.status.setText("This folder has no instrumental.")
             return
         if stem != self.timeline.stem:
@@ -1720,8 +2267,8 @@ class SectionEditor(QWidget):
         if self.timeline.stem == "inst":
             self.with_demucs.setText("Play against Demucs instrumental")
             self.with_demucs.setToolTip(
-                "On plays the output against the Demucs instrumental.\n"
-                "Off plays the instrumental output alone."
+                "On plays the instrumental against the Demucs instrumental.\n"
+                "Off plays the instrumental with the acapella."
             )
             self.align_lines.setToolTip(
                 "Lines mark the same moment on both lanes.\n"
@@ -1756,6 +2303,13 @@ class SectionEditor(QWidget):
         if tl.stem == "inst":
             if hear_dem and self._data is not None and self._data.get("demucs_inst") is not None:
                 return out, "dinst"
+            if (
+                not self.with_demucs.isChecked()
+                and not any(tl.solo.values())
+                and self._data is not None
+                and self._data.get("aca") is not None
+            ):
+                return out, "aca"
             return out, None
         if hear_dem:
             return out, "vox"
@@ -1820,6 +2374,10 @@ class SectionEditor(QWidget):
             dinst = self._match_play_rate(self._as_stereo(self._data.get("demucs_inst")))
             self._dinst_st = None if dinst is None else np.ascontiguousarray(dinst, dtype=np.float32)
             self._play.set_bed("dinst", self._dinst_st)
+        if self._aca_st is None:
+            aca = self._match_play_rate(self._as_stereo(self._data.get("aca")))
+            self._aca_st = None if aca is None else np.ascontiguousarray(aca, dtype=np.float32)
+            self._play.set_bed("aca", self._aca_st)
 
     def _invalidate_aca_play(self) -> None:
         self._aca_play = None
@@ -1939,11 +2497,17 @@ class SectionEditor(QWidget):
             self.status.setText("Move the playhead further inside the section before splitting.")
             return
         self._push_undo()
-        src_cut = sec.src0 + (t - sec.dst0)
-        sections[idx : idx + 1] = [
-            Section(sec.src0, src_cut, sec.dst0),
-            Section(src_cut, sec.src1, t),
-        ]
+        span = max(1e-6, sec.out_dur)
+        frac = (t - sec.dst0) / span
+        src_cut = sec.src0 + frac * sec.dur
+        left = Section(sec.src0, src_cut, sec.dst0)
+        right = Section(src_cut, sec.src1, t)
+        left_out, right_out = t - sec.dst0, sec.dst1 - t
+        if abs(left_out - left.dur) > 1e-4:
+            left.dst_dur = left_out
+        if abs(right_out - right.dur) > 1e-4:
+            right.dst_dur = right_out
+        sections[idx : idx + 1] = [left, right]
         self._invalidate_aca_play()
         if self._is_playing():
             self._ensure_aca_play()
@@ -1958,11 +2522,16 @@ class SectionEditor(QWidget):
         self.timeline.show_alignment = bool(on)
         self.timeline.update()
 
+    def _toggle_bars(self, on: bool) -> None:
+        self.timeline.show_bars = bool(on)
+        self.timeline._cue_tip = ""
+        self.timeline.update()
+
     def _reset(self) -> None:
         initial = self._initial.get(self.timeline.stem, ())
         if self._section_snapshot() != initial:
             self._push_undo()
-        self.timeline.sections = [Section(a, b, dst) for a, b, dst in initial]
+        self.timeline.sections = [section_from_snap(item) for item in initial]
         self._invalidate_aca_play()
         if self._is_playing():
             self._ensure_aca_play()
@@ -2056,7 +2625,7 @@ class SectionEditor(QWidget):
         self._halt_audio()
         self._remember_sections()
         sections = [
-            Section(s.src0, s.src1, s.dst0) for s in self.timeline.sections
+            Section(s.src0, s.src1, s.dst0, s.dst_dur) for s in self.timeline.sections
         ]
         self._applied_stem = stem
         self._set_busy(True)
@@ -2120,7 +2689,7 @@ class SectionEditor(QWidget):
         self._remember_sections()
         kept = None
         other_sections = self._section_bank.get(other) or []
-        other_snap = tuple((s.src0, s.src1, s.dst0) for s in other_sections)
+        other_snap = tuple(s.snap() for s in other_sections)
         if other_snap != self._initial.get(other, ()):
             kept = (
                 other,
@@ -2136,9 +2705,7 @@ class SectionEditor(QWidget):
             self._undo[stem] = undo
             self._initial[stem] = initial
         if view == "inst" and self._data is not None and self._data.get("inst") is not None:
-            self.stem_box.blockSignals(True)
-            self.stem_box.setCurrentIndex(1)
-            self.stem_box.blockSignals(False)
+            self._set_stem_choice("inst")
             self.timeline.set_stem("inst")
             self.timeline.sections = list(self._section_bank.get("inst") or [])
             self._apply_pair_chrome()

@@ -39,9 +39,15 @@ DEFAULT_STEM_LAG_MAX_SEC = DEFAULT_DRIFT_MS / 1000.0
 # Coarse chroma search. One frame is coarser than the perceptual gate, so only
 # an offset beyond the fine search window fails here.
 DEFAULT_COARSE_LAG_MAX_SEC = 0.050
+# Clock used when the original has no trustworthy 8-bar line. The pass test
+# otherwise starts each window on the same downbeats as the stretch markers.
 CHECKPOINT_EVERY_SEC = 30.0
 CHECKPOINT_WIN_SEC = 8.0
 CHECKPOINT_MAX_LAG_SEC = 0.040
+# A drum groove always has a hit inside ±40 ms. Look out to 1 s, and keep
+# that farther peak when it matches more strongly than the nearest hat.
+CHECKPOINT_CONFIRM_LAG_SEC = 1.0
+CHECKPOINT_CONFIRM_GAIN = 1.12
 # Second look when a checkpoint sits on the ±40 ms edge. The pass test stays
 # at 40 ms. The repair warp needs the real offset, still from onsets.
 REPAIR_WIDE_LAG_SEC = 0.200
@@ -448,19 +454,15 @@ def offset_grade(abs_ms: float) -> str:
     return "bad"
 
 
-def _parabolic_peak(corr: np.ndarray, center: int, max_lag: int) -> float:
-    """Sub-sample lag in samples. Positive means the query is early."""
-    i = int(np.argmax(corr))
+def _peak_lag_frames(corr: np.ndarray, mid: int, index: int) -> float:
+    """Lag of one correlation peak, in frames relative to ``mid``."""
     delta = 0.0
-    if 0 < i < len(corr) - 1:
-        y0, y1, y2 = float(corr[i - 1]), float(corr[i]), float(corr[i + 1])
+    if 0 < index < len(corr) - 1:
+        y0, y1, y2 = float(corr[index - 1]), float(corr[index]), float(corr[index + 1])
         denom = y0 - 2.0 * y1 + y2
         if abs(denom) > 1e-12:
-            delta = 0.5 * (y0 - y2) / denom
-            delta = float(np.clip(delta, -1.0, 1.0))
-    # correlate(ref, qry): index (len(qry)-1 + k) is lag k, where positive k
-    # means the query must be delayed to match, i.e. the query is early.
-    return (i - center) + delta
+            delta = float(np.clip(0.5 * (y0 - y2) / denom, -1.0, 1.0))
+    return float(index - mid) + delta
 
 
 def _onset_activity_floor(env: np.ndarray) -> float:
@@ -482,6 +484,30 @@ def _window_has_audio(env: np.ndarray, floor: float) -> bool:
     return float(np.percentile(env, 90)) >= floor
 
 
+def checkpoint_sample_times(original: Path) -> tuple[np.ndarray | None, str]:
+    """8-bar downbeats where each pass window starts.
+
+    Same ruler as the stretch markers. None keeps the 30 s clock.
+    """
+    try:
+        import soundfile as sf
+        from beat_phase import track_file
+        from warp_align_fail_all import bar_mark_times
+
+        info = sf.info(str(original))
+        duration = float(info.frames) / float(info.samplerate)
+        if duration <= 0.0:
+            return None, "checkpoints=30s"
+        _beats, downbeats = track_file(Path(original))
+        found = bar_mark_times(downbeats, duration)
+    except Exception:  # noqa: BLE001 — a missing bar line keeps the 30 s clock
+        return None, "checkpoints=30s"
+    if found is None:
+        return None, "checkpoints=30s"
+    marks, span = found
+    return np.asarray(marks, dtype=float), f"checkpoints=8bars; bar_span={span:.1f}s"
+
+
 def checkpoint_offsets(
     reference: np.ndarray,
     query: np.ndarray,
@@ -491,14 +517,16 @@ def checkpoint_offsets(
     win_sec: float = CHECKPOINT_WIN_SEC,
     max_lag_sec: float = CHECKPOINT_MAX_LAG_SEC,
     at_times: np.ndarray | None = None,
+    confirm_sec: float | None = None,
 ) -> list[tuple[float, float, bool]]:
     """Sample-accurate offset at points through the song.
 
     Returns (time_sec, lag_sec, railed). Positive lag means the query is early
     and needs a delay. Railed means the peak sat on the search edge, so the
-    true offset is larger than max_lag_sec. A slow walk that stays inside the
-    limit is not the same as a sudden step; both are reported and the caller
-    judges them separately.
+    true offset is larger than the window that was searched. ``confirm_sec``
+    looks past the near window and keeps a farther peak when it matches more
+    strongly than the nearest hit. A slow walk that stays inside the limit is
+    not the same as a sudden step; both are reported and the caller judges them.
     """
     from scipy.signal import correlate
 
@@ -554,10 +582,26 @@ def checkpoint_offsets(
         window = corr[lo:hi]
         if window.size < 3:
             continue
-        center = mid - lo
-        lag_frames = _parabolic_peak(window, center, max_lag)
+        near_i = lo + int(np.argmax(window))
+        chosen_i = near_i
+        chosen_radius = max_lag
+        if confirm_sec is not None and float(confirm_sec) > max_lag_sec:
+            confirm_lag = max(max_lag + 1, int(float(confirm_sec) / hop_sec))
+            clo = max(0, mid - confirm_lag)
+            chi = min(len(corr), mid + confirm_lag + 1)
+            wide_i = clo + int(np.argmax(corr[clo:chi]))
+            near_c = float(corr[near_i])
+            wide_c = float(corr[wide_i])
+            outside = abs(wide_i - mid) > max_lag
+            stronger = wide_c > 0.0 and (
+                near_c <= 0.0 or wide_c >= CHECKPOINT_CONFIRM_GAIN * near_c
+            )
+            if outside and stronger:
+                chosen_i = wide_i
+                chosen_radius = confirm_lag
+        lag_frames = _peak_lag_frames(corr, mid, chosen_i)
         lag_sec = float(lag_frames) * hop_sec
-        railed = abs(lag_frames) >= max_lag - 1.0
+        railed = abs(chosen_i - mid) >= chosen_radius - 1
         center_t = (start + (end - start) / 2) * hop_sec
         points.append((float(center_t), lag_sec, railed))
     return points
@@ -738,14 +782,31 @@ def _review_amount(points: list[tuple[float, float, bool]]) -> str:
     return f"{left} to {right}"
 
 
+def _checkpoint_parts(point: object) -> tuple[float, float, bool] | None:
+    """[time_sec, lag_ms, search_edge], or the same fields on a dict."""
+    if isinstance(point, dict):
+        time_sec = point.get("time_sec", point.get("t"))
+        lag_ms = point.get("lag_ms", point.get("lag"))
+        edge = point.get("search_edge", point.get("railed", False))
+        if not isinstance(time_sec, (int, float)) or not isinstance(lag_ms, (int, float)):
+            return None
+        return (float(time_sec), float(lag_ms), bool(edge))
+    if isinstance(point, (list, tuple)) and len(point) >= 2:
+        if not isinstance(point[0], (int, float)) or not isinstance(point[1], (int, float)):
+            return None
+        edge = point[2] if len(point) > 2 else False
+        return (float(point[0]), float(point[1]), bool(edge))
+    return None
+
+
 def drift_ranges(points: list, *, limit_ms: float = DEFAULT_DRIFT_MS) -> str:
     """One stem's 'drifts between' text. ``points`` are [time_sec, lag_ms, search_edge]."""
     half = CHECKPOINT_WIN_SEC / 2.0
     parsed: list[tuple[float, float, bool]] = []
     for point in points or []:
-        if not isinstance(point, (list, tuple)) or len(point) < 2:
-            continue
-        parsed.append((float(point[0]), float(point[1]), bool(point[2]) if len(point) > 2 else False))
+        parts = _checkpoint_parts(point)
+        if parts is not None:
+            parsed.append(parts)
     if not parsed:
         return ""
 
@@ -874,10 +935,12 @@ def stem_verdicts(
 ) -> tuple[str, str, str, float, float, float, float, float, float, str]:
     """Score each stem against its Demucs reference.
 
-    Pass/fail uses the onset checkpoints every 30 s. A stem passes when every
+    Pass/fail uses onset checkpoints on the original's 8-bar downbeats, or
+    every 30 s when that bar line is missing. A stem passes when every
     checkpoint stays inside drift_ms, including when the coarse chroma check
-    had failed. A silent stretch is not a checkpoint. A point past drift_ms
-    fails the stem. A step between two in-limit points does not.
+    had failed. A nearer hat does not count when a stronger match sits further
+    out, up to one second. A silent stretch is not a checkpoint. A point past
+    drift_ms fails the stem. A step between two in-limit points does not.
 
     Returns (aca_verdict, inst_verdict, combined, aca_corr, inst_corr,
     aca_drift_ms, inst_drift_ms, aca_lag_sec, inst_lag_sec, notes,
@@ -905,8 +968,17 @@ def stem_verdicts(
         demucs_inst, inst, **kwargs
     )
     coarse_max = max(DEFAULT_COARSE_LAG_MAX_SEC, float(lag_max_sec))
-    aca_points = checkpoint_offsets(vox, aca, sr)
-    inst_points = checkpoint_offsets(demucs_inst, inst, sr)
+    sample_times, sample_note = checkpoint_sample_times(original)
+    aca_points = checkpoint_offsets(
+        vox, aca, sr, at_times=sample_times, confirm_sec=CHECKPOINT_CONFIRM_LAG_SEC
+    )
+    inst_points = checkpoint_offsets(
+        demucs_inst,
+        inst,
+        sr,
+        at_times=sample_times,
+        confirm_sec=CHECKPOINT_CONFIRM_LAG_SEC,
+    )
     aca_verdict, aca_notes, aca_lag = _apply_offset_gate(
         aca_verdict, aca_notes, aca_lag, aca_points, drift_ms, coarse_max_sec=coarse_max
     )
@@ -918,7 +990,7 @@ def stem_verdicts(
         f"aca_check={aca_verdict} corr={aca_corr:.3f} lag={aca_lag:+.3f}s"
         f" drift={aca_drift:.1f}ms ({aca_notes}); "
         f"inst_check={inst_verdict} corr={inst_corr:.3f} lag={inst_lag:+.3f}s"
-        f" drift={inst_drift:.1f}ms ({inst_notes})"
+        f" drift={inst_drift:.1f}ms ({inst_notes}); {sample_note}"
     )
     return (
         aca_verdict,

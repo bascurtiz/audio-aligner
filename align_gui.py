@@ -87,27 +87,37 @@ SORT_ROLE = SEEN_NAME_ROLE + 1
 ROW_ROLE = SORT_ROLE + 1
 
 
+def _json_keep(value: object) -> bool:
+    """True when the results file can store this value."""
+    if value is None or isinstance(value, (str, int, float, bool, Path)):
+        return True
+    if isinstance(value, (list, tuple)):
+        return all(_json_keep(item) for item in value)
+    if isinstance(value, dict):
+        return all(_json_keep(item) for item in value.values())
+    return False
+
+
 def _json_value(value: object) -> object:
     if isinstance(value, Path):
         return str(value)
-    if isinstance(value, float) and not math.isfinite(value):
-        return None
-    if value is None or isinstance(value, (str, int, float, bool)):
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if value is None or isinstance(value, (str, int, bool)):
         return value
     if isinstance(value, (list, tuple)):
         return [_json_value(item) for item in value]
+    if isinstance(value, dict):
+        return {str(key): _json_value(item) for key, item in value.items()}
     return None
 
 
 def _json_ready(row: dict) -> dict:
-    """Keep only values the results file can store."""
+    """Keep values the results file can store."""
     out: dict = {}
     for key, value in row.items():
-        stored = _json_value(value)
-        if stored is None and not isinstance(value, (list, tuple)) and value is not None:
-            if not isinstance(value, float):
-                continue
-        out[str(key)] = stored
+        if _json_keep(value):
+            out[str(key)] = _json_value(value)
     return out
 
 
@@ -690,6 +700,7 @@ class MainWindow(QWidget):
         self._center_pending = True
         self.worker: AlignWorker | None = None
         self._player_proc: subprocess.Popen | None = None
+        self._player_root = STEM_ORG_DEFAULT
         self._inplace_update = False
         self._inplace_stem: str | None = None
         self._progress_modal = None
@@ -1702,6 +1713,9 @@ class MainWindow(QWidget):
         csv_path = data.get("csv_path")
         if isinstance(csv_path, str) and csv_path.strip():
             self.csv_edit.setText(csv_path)
+        player = data.get("player_root")
+        if isinstance(player, str) and player.strip():
+            self._player_root = Path(player)
         only = data.get("only")
         if isinstance(only, str):
             self.only_edit.setText(only)
@@ -1731,6 +1745,10 @@ class MainWindow(QWidget):
             if isinstance(key, str) and isinstance(value, str) and value.strip()
         }
 
+    def _report_save_error(self, label: str) -> None:
+        if getattr(self, "status", None) is not None:
+            self.status.setText(f"Could not save {label}")
+
     def _save_comments(self) -> None:
         try:
             COMMENTS_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -1741,7 +1759,7 @@ class MainWindow(QWidget):
             )
             tmp.replace(COMMENTS_PATH)
         except OSError:
-            return
+            self._report_save_error("comments")
 
     def _stem_key(self, folder_name: str, folder_path: str = "") -> str:
         name = Path(folder_path).name if folder_path else folder_name
@@ -1827,7 +1845,7 @@ class MainWindow(QWidget):
             tmp.write_text(json.dumps(rows, indent=2), encoding="utf-8")
             tmp.replace(RESULTS_PATH)
         except OSError:
-            return
+            self._report_save_error("results")
 
     def _apply_saved_number(self, widget: QSpinBox | QDoubleSpinBox, value: object) -> None:
         if isinstance(value, bool) or not isinstance(value, (int, float)):
@@ -1841,6 +1859,7 @@ class MainWindow(QWidget):
             "declick": self._radio_value(self.declick_group, "rx"),
             "reaper_exe": self.reaper_edit.text(),
             "csv_path": self.csv_edit.text(),
+            "player_root": str(self._player_root),
             "only": self.only_edit.text(),
             "limit": self.limit_spin.value(),
             "dry_run": self.dry_run.isChecked(),
@@ -1858,7 +1877,7 @@ class MainWindow(QWidget):
             tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
             tmp.replace(SETTINGS_PATH)
         except OSError:
-            return
+            self._report_save_error("settings")
 
     def _watch_settings(self) -> None:
         self._settings_timer = QTimer(self)
@@ -2669,12 +2688,13 @@ class MainWindow(QWidget):
         if not PLAYER_LAUNCHER.is_file():
             QMessageBox.critical(self, "Player missing", f"Launcher not found:\n{PLAYER_LAUNCHER}")
             return
-        if not (STEM_ORG_DEFAULT / "stem_organizer" / "player" / "stem_player_window.py").is_file():
+        player_root = self._player_root
+        if not (player_root / "stem_organizer" / "player" / "stem_player_window.py").is_file():
             QMessageBox.critical(
                 self,
                 "STEM organizer missing",
-                f"Stem player not found at:\n{STEM_ORG_DEFAULT}\n"
-                "Install/clone STEM-organizer or update the path in launch_stem_player.py.",
+                f"Stem player not found at:\n{player_root}\n"
+                f"Set player_root in:\n{SETTINGS_PATH}",
             )
             return
 
@@ -2693,12 +2713,12 @@ class MainWindow(QWidget):
             "--library",
             str(song.parent),
             "--stem-org",
-            str(STEM_ORG_DEFAULT),
+            str(player_root),
         ]
         try:
             self._player_proc = subprocess.Popen(
                 cmd,
-                cwd=str(STEM_ORG_DEFAULT),
+                cwd=str(player_root),
             )
         except OSError as exc:
             QMessageBox.critical(self, "Could not start player", str(exc))

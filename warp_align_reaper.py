@@ -61,7 +61,6 @@ from warp_align_fail_all import (
     peak_norm,
     absorb_lag_offset,
     follow_lag_src_dst,
-    bar_mark_times,
     smooth_lags,
     stretch_src_dst,
     tag_folder_verdict,
@@ -545,17 +544,9 @@ def marker_bar_grid(orig: Path, target_sec: float) -> tuple[np.ndarray | None, s
     The lag at each mark is still the measured lag. A tracker failure keeps
     the 30 s marks.
     """
-    try:
-        from beat_phase import track_file
+    from warp_align_fail_all import bar_grid_for
 
-        _beats, downbeats = track_file(orig)
-    except Exception:  # noqa: BLE001 — a missing bar line falls back to 30 s
-        return None, "lag_follow=30s"
-    found = bar_mark_times(downbeats, target_sec)
-    if found is None:
-        return None, "lag_follow=30s"
-    marks, span = found
-    return marks, f"lag_follow=8bars; bar_span={span:.1f}s"
+    return bar_grid_for(orig, target_sec)
 
 
 def stage_stem_reaper(
