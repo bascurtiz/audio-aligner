@@ -378,13 +378,15 @@ def src_dst_from_lags(
     jump_times: list[float] | None = None,
     scores: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Positions on the padded wav: src = dst - residual lag.
+    """Sample the solved lag. This is not a second solver.
 
-    The residual is the full lag with the constant offset removed. Adding
-    that offset as front padding puts these coordinates on the file the
-    renderer opens. ``map_stem`` subtracts the pad before storing ``src``,
-    so stored source times are original-stem times. Every returned marker
-    keeps that residual: padded source and ``dst - lag`` agree.
+    Acceleration limiting happens once, in ``solve_constrained_lag_path``.
+    Here ``src = dst - residual lag``, plus a 0.1 ms monotonic nudge that
+    skips jumps of 40 ms or more. The residual already has the constant
+    offset removed, so the first marker is not pinned to zero: forcing it
+    and integrating rates walks every later marker off the solved path.
+    ``map_stem`` subtracts the pad before storing ``src``. The renderer
+    adds it back, and padded source then agrees with ``dst - lag``.
     """
     t = np.asarray(times, dtype=float).reshape(-1)
     lag = np.asarray(lags, dtype=float).reshape(-1)

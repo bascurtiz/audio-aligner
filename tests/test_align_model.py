@@ -7,7 +7,9 @@ import unittest
 import numpy as np
 
 from align_model.benchmark import (
+    SR,
     case_continuous_vocal,
+    harmonic,
     case_drift,
     case_gaps,
     case_noise,
@@ -25,7 +27,7 @@ from align_model.beats import beat_alignment_score
 from align_model.evidence import EvidencePoint, context_weights, fuse_candidates
 from align_model.gaps import PhraseUnit, render_gap_aware, spans_from_units
 from align_model.params import resolve_profile
-from align_model.pipeline import map_from_points
+from align_model.pipeline import _model_phrase, map_from_points
 from align_model.quality import apply_codes, is_compensating, stamp_result
 from align_model.time_map import (
     _clamp_accel,
@@ -290,6 +292,58 @@ class TimeMapTests(unittest.TestCase):
             err = float(np.max(np.abs(padded - (stem.dst - residual))))
             self.assertLess(err, 0.001, lag_at(1.0))
 
+    def test_marker_sampling_does_not_limit_acceleration(self) -> None:
+        """A corner the solver would rewrite is copied through unchanged."""
+        times = np.arange(0.0, 8.0, 0.5)
+        lag = np.zeros_like(times)
+        lag[8:] = 0.03
+        src, dst = src_dst_from_lags(
+            times,
+            lag,
+            target_sec=8.0,
+            in_sec=8.0,
+            min_spacing=0.5,
+            max_spacing=0.5,
+            curvature_gain=1.0,
+        )
+        lag_at = np.interp(dst, times, lag)
+        self.assertLess(float(np.max(np.abs(src - (dst - lag_at)))), 0.001)
+        _limited, stats = _clamp_accel(times, lag, 0.02)
+        self.assertGreater(stats["n_modified"], 0)
+        self.assertGreater(float(np.max(np.abs(lag - _limited))), 0.001)
+
+    def test_final_map_coordinate_contract(self) -> None:
+        """Stored source plus pad is the padded-wav position of the solved lag."""
+        cases = (
+            (lambda t: (0.10, 0.9, 0.4), 12.0),
+            (lambda t: (-0.10, 0.9, 0.4), 12.0),
+            (lambda t: (0.012 * t, 0.9, 0.4), 8.0),
+            (lambda t: (0.04 * np.sin(2 * np.pi * t / 6.0), 0.9, 0.4), 8.0),
+            (lambda t: (0.08 if t >= 4.0 else 0.0, 0.9, 0.45), 8.0),
+        )
+        for lag_at, length in cases:
+            stem = map_from_points(self._points(lag_at), target_sec=length, in_sec=length)
+            padded = source_on_padded_wav(stem.src, stem.pad_sec)
+            self.assertTrue(np.allclose(padded, stem.src + stem.pad_sec), lag_at(1.0))
+            self.assertGreater(len(padded), 1, lag_at(1.0))
+            self.assertTrue(np.all(np.diff(stem.dst) > 0), lag_at(1.0))
+            self.assertTrue(np.all(np.diff(padded) > -1e-3), lag_at(1.0))
+            residual = np.interp(stem.dst, stem.times, stem.lags - stem.pad_sec)
+            jump = np.zeros(len(stem.dst), dtype=bool)
+            if len(residual) > 1:
+                step = np.abs(np.diff(residual)) >= 0.04
+                jump[1:] = step
+                jump[:-1] |= step
+            smooth = ~jump
+            if np.any(smooth):
+                err = np.abs(padded[smooth] - (stem.dst[smooth] - residual[smooth]))
+                self.assertLess(float(np.max(err)), 0.001, lag_at(1.0))
+            opened = length + max(float(stem.pad_sec), 0.0)
+            # A marker inserted at destination 0, before the first evidence
+            # sample, can sit a few milliseconds before file time 0.
+            self.assertTrue(np.all(padded >= -0.02), lag_at(1.0))
+            self.assertTrue(np.all(padded <= opened + 1e-3), lag_at(1.0))
+
     def test_rate_limiter_records_how_far_it_moves_the_map(self) -> None:
         times = np.arange(0.0, 8.0, 0.5)
         straight = 0.01 * times
@@ -379,6 +433,36 @@ class GapTests(unittest.TestCase):
 
         self.assertLess(abs(peak_hz(early) - 196.0), 4.0)
         self.assertLess(abs(peak_hz(late) - 330.0), 4.0)
+
+    def test_phrase_offset_is_applied_once(self) -> None:
+        """A phrase 100 ms early reads 9.900 and lands at 10.000."""
+        phrase = harmonic(SR, 2.0, 220.0)
+        total = int(14.0 * SR)
+        ref = np.zeros(total, dtype=np.float32)
+        qry = np.zeros(total, dtype=np.float32)
+        ref[int(10.0 * SR) : int(10.0 * SR) + len(phrase)] = phrase
+        qry[int(9.9 * SR) : int(9.9 * SR) + len(phrase)] = phrase
+        unit = PhraseUnit(9.9, 11.9, 10.0, 12.0, 0.1, 0.1, 0.0, 0.9, 0.4)
+        profile = resolve_profile(ref, SR, name="default", win_sec=1.2, step_sec=0.4, max_lag_sec=0.6)
+        spans = _model_phrase(unit, qry, ref, SR, profile, None, None)
+        self.assertIsNotNone(spans)
+
+        def dst_at(src: float) -> float:
+            for span in spans:
+                if span.kind != "speech":
+                    continue
+                if span.src_start - 1e-3 <= src <= span.src_end + 1e-3:
+                    width = span.src_end - span.src_start
+                    share = 0.0 if width <= 1e-6 else (src - span.src_start) / width
+                    return span.dst_start + share * (span.dst_end - span.dst_start)
+            self.fail(f"no speech span covers source {src}")
+
+        start = dst_at(9.9)
+        middle = dst_at(10.9)
+        self.assertLess(abs(start - 10.0), 0.04)
+        self.assertLess(abs(middle - 11.0), 0.04)
+        self.assertGreater(abs(start - 10.1), abs(start - 10.0))
+        self.assertGreater(abs(middle - 11.1), abs(middle - 11.0))
 
     def test_continuous_vocal_is_one_global_map(self) -> None:
         """Same timing stays on map_stem: one curve, no restored rest."""

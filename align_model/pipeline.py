@@ -205,8 +205,11 @@ def _model_phrase(
     spans: list[MapSpan] = []
     shift = float(stem.pad_sec)
     for src, dst, nxt_src, nxt_dst in zip(stem.src[:-1], stem.dst[:-1], stem.src[1:], stem.dst[1:]):
-        # src is an original-phrase time. The phrase audio is not padded, so
-        # the read position is the padded-wav coordinate src + shift.
+        # stem.src has the local pad removed. The phrase file is not padded,
+        # so the read adds that pad back once. stem.dst is a time in the
+        # reference window, and the same pad is the query-to-reference
+        # offset, so the destination adds it once. A phrase that is 100 ms
+        # early then reads query 9.900 and writes reference 10.000.
         src0 = float(unit.src_start) + float(src) + shift
         src1 = float(unit.src_start) + float(nxt_src) + shift
         dst0 = origin + shift + float(dst)
