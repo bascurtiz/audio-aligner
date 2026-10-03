@@ -25,7 +25,12 @@ from align_model.gaps import PhraseUnit, render_gap_aware, spans_from_units
 from align_model.params import resolve_profile
 from align_model.pipeline import map_from_points
 from align_model.quality import apply_codes, is_compensating, stamp_result
-from align_model.time_map import adaptive_marker_times, solve_constrained_lag_path, source_on_padded_wav
+from align_model.time_map import (
+    adaptive_marker_times,
+    solve_constrained_lag_path,
+    source_on_padded_wav,
+    src_dst_from_lags,
+)
 
 
 class DecomposeTests(unittest.TestCase):
@@ -234,6 +239,62 @@ class TimeMapTests(unittest.TestCase):
         self.assertAlmostEqual(src_late, 10.10, delta=0.04)
         file_late = float(source_on_padded_wav(np.array([src_late]), trimmed.pad_sec)[0])
         self.assertAlmostEqual(file_late, 10.0, delta=0.04)
+
+    def test_renderer_pad_round_trip(self) -> None:
+        """Stored source time 10.000 s plus the pad is the padded-file position."""
+        stored = np.array([10.0])
+        self.assertAlmostEqual(float(source_on_padded_wav(stored, 0.200)[0]), 10.200)
+        self.assertAlmostEqual(float(source_on_padded_wav(stored, -0.200)[0]), 9.800)
+        sr = 1000
+        stem = np.zeros(12 * sr, dtype=np.float32)
+        stem[10 * sr] = 1.0
+        padded = np.concatenate([np.zeros(int(0.200 * sr), dtype=np.float32), stem])
+        file_at = int(round(float(source_on_padded_wav(stored, 0.200)[0]) * sr))
+        self.assertEqual(float(padded[file_at]), 1.0)
+        trimmed = stem[int(0.200 * sr) :]
+        file_trim = int(round(float(source_on_padded_wav(stored, -0.200)[0]) * sr))
+        self.assertEqual(float(trimmed[file_trim]), 1.0)
+
+    def test_first_marker_starts_at_the_input(self) -> None:
+        """A negative opening source time is pinned to 0. The pad carries that offset."""
+        src, dst = src_dst_from_lags(
+            np.array([0.0, 2.0, 4.0, 6.0]),
+            np.array([0.08, 0.0, 0.0, 0.0]),
+            target_sec=6.0,
+            in_sec=6.0,
+            min_spacing=2.0,
+            max_spacing=30.0,
+            curvature_gain=1.0,
+        )
+        self.assertEqual(float(dst[0]), 0.0)
+        self.assertEqual(float(src[0]), 0.0)
+        self.assertAlmostEqual(float(dst[0] - 0.08), -0.08)
+        self.assertTrue(np.all(np.diff(src) >= -1e-3))
+
+    def test_jumps_and_spikes_in_the_marker_map(self) -> None:
+        def hold(step: float):
+            def lag_at(t: float):
+                return (step if t >= 4.0 else 0.0), 0.9, 0.45
+            return map_from_points(self._points(lag_at), target_sec=8.0, in_sec=8.0)
+
+        for step in (0.08, 0.20):
+            stem = hold(step)
+            early = float(np.median(stem.lags[stem.times < 3.5]))
+            late = float(np.median(stem.lags[stem.times > 5.0]))
+            self.assertGreater(late - early, step * 0.6, step)
+            self.assertTrue(np.all(np.diff(stem.src) >= -1e-3))
+            self.assertTrue(np.all(np.diff(stem.dst) >= -1e-3))
+
+        def weak_at(*centers: float):
+            def lag_at(t: float):
+                if any(abs(t - c) < 0.2 for c in centers):
+                    return 0.05, 0.15, 0.01
+                return 0.0, 0.85, 0.40
+            return lag_at
+
+        for centers in ((4.0,), (3.0, 5.0)):
+            stem = map_from_points(self._points(weak_at(*centers)), target_sec=8.0, in_sec=8.0)
+            self.assertLess(float(np.max(np.abs(stem.lags))), 0.03, centers)
 
 
 class GapTests(unittest.TestCase):

@@ -902,7 +902,9 @@ def _align_folder_model(
         max_pad_sec=max_pad_sec,
     )
     max_pad_sec = profile.max_pad_sec
-    aca_pad, aca_score = chroma_xcorr_pad(
+    # Chroma is a diagnostic only. The model sees the unshifted stem and
+    # its own offset is the only pad the renderer adds.
+    aca_chroma, aca_score = chroma_xcorr_pad(
         orig_vox, aca_vox, sr=SR_ANALYSIS, max_pad_sec=max_pad_sec
     )
     from demucs_vocals import load_instrumental_mono, load_vocals_mono
@@ -910,23 +912,22 @@ def _align_folder_model(
     _emit_step(on_step, "demucs")
     inst_ref = peak_norm(load_instrumental_mono(orig, SR_ANALYSIS, folder=folder))
     vocal_ref = peak_norm(bandpass(load_vocals_mono(orig, SR_ANALYSIS, folder=folder), SR_ANALYSIS))
-    inst_pad, inst_score = chroma_xcorr_pad(
+    inst_chroma, inst_score = chroma_xcorr_pad(
         inst_ref, inst_m, sr=SR_ANALYSIS, max_pad_sec=max_pad_sec
     )
-    inst_p = fit_len(pad_or_trim_front(inst_m, inst_pad, SR_ANALYSIS), len(inst_ref))
     beats, downbeats = load_beats(orig)
     inst_map = map_stem(
         inst_ref,
-        peak_norm(inst_p),
+        inst_m,
         SR_ANALYSIS,
         kind="instrumental",
         profile=profile,
         beats=beats,
         downbeats=downbeats,
         target_sec=len(inst_ref) / SR_ANALYSIS,
-        in_sec=len(inst_p) / SR_ANALYSIS,
+        in_sec=len(inst_m) / SR_ANALYSIS,
     )
-    inst_pad = float(inst_pad + inst_map.pad_sec)
+    inst_pad = float(inst_map.pad_sec)
     if gaps_cut:
         _emit_step(on_step, "silence")
         aca_map = map_vocal_gaps(
@@ -940,20 +941,18 @@ def _align_folder_model(
         )
         result.aca_pad_sec = float(aca_map.pad_sec)
     else:
-        aca_p = fit_len(pad_or_trim_front(aca_m, aca_pad, SR_ANALYSIS), len(orig_m))
-        aca_pv = peak_norm(bandpass(peak_norm(aca_p), SR_ANALYSIS))
         aca_map = map_stem(
             orig_vox,
-            aca_pv,
+            aca_vox,
             SR_ANALYSIS,
             kind="vocal",
             profile=profile,
             beats=beats,
             downbeats=downbeats,
             target_sec=len(orig_vox) / SR_ANALYSIS,
-            in_sec=len(aca_pv) / SR_ANALYSIS,
+            in_sec=len(aca_vox) / SR_ANALYSIS,
         )
-        result.aca_pad_sec = float(aca_pad + aca_map.pad_sec)
+        result.aca_pad_sec = float(aca_map.pad_sec)
     result.inst_pad_sec = inst_pad
     if len(aca_map.lags):
         result.aca_drift_range_ms = float((float(np.max(aca_map.lags)) - float(np.min(aca_map.lags))) * 1000)
@@ -967,6 +966,7 @@ def _align_folder_model(
     result.notes = (
         f"engine=rubberband-model{'+aca_gaps' if gaps_cut else ''}; "
         f"aca_score={aca_score:.3f}; inst_score={inst_score:.3f}; "
+        f"chroma_pad=({aca_chroma:+.3f},{inst_chroma:+.3f}); "
         f"{notes_fragment(report)}; inst_elastique_ref=demucs_instrumental"
     )
     result.notes += "; aca_gaps=1" if gaps_cut else "; aca_gaps=0"
