@@ -99,7 +99,26 @@ def map_stem(
         target_sec=target,
         in_sec=source_sec,
     )
-    pad = float(np.clip(measured.offset_sec, -profile.max_pad_sec, profile.max_pad_sec))
+    measured_pad = float(measured.offset_sec)
+    # Clipping the pad and still subtracting it would leave src short of a
+    # real source time by the amount that was clipped. An offset past the
+    # pad limit is a bad match, so the warp falls back to an identity map.
+    if abs(measured_pad) > float(profile.max_pad_sec):
+        report = apply_codes(measured, margins=evidence.margins)
+        report["kind"] = kind
+        report["pad_rejected"] = True
+        report["measured_pad_sec"] = measured_pad
+        return StemMap(
+            times=np.asarray(_times, dtype=float),
+            lags=np.asarray(mapped, dtype=float),
+            scores=evidence.scores,
+            src=np.array([0.0, max(source_sec, 0.0)]),
+            dst=np.array([0.0, max(target, 0.0)]),
+            pad_sec=0.0,
+            report=report,
+            kind=kind,
+        )
+    pad = measured_pad
     # The solver's src is a position in the padded wav. Store the original
     # stem time. Renderers add pad back when they address that wav.
     src = np.asarray(src, dtype=float) - pad
@@ -203,17 +222,14 @@ def _model_phrase(
     if abs(float(stem.pad_sec)) > 0.12 and confidence < 0.45:
         return None
     spans: list[MapSpan] = []
-    shift = float(stem.pad_sec)
     for src, dst, nxt_src, nxt_dst in zip(stem.src[:-1], stem.dst[:-1], stem.src[1:], stem.dst[1:]):
-        # stem.src has the local pad removed. The phrase file is not padded,
-        # so the read adds that pad back once. stem.dst is a time in the
-        # reference window, and the same pad is the query-to-reference
-        # offset, so the destination adds it once. A phrase that is 100 ms
-        # early then reads query 9.900 and writes reference 10.000.
-        src0 = float(unit.src_start) + float(src) + shift
-        src1 = float(unit.src_start) + float(nxt_src) + shift
-        dst0 = origin + shift + float(dst)
-        dst1 = origin + shift + float(nxt_dst)
+        # stem.src is already the time in the unpadded query slice, and
+        # stem.dst is already the time in the reference window. The local
+        # pad was removed when src was stored, so it is not added again.
+        src0 = float(unit.src_start) + float(src)
+        src1 = float(unit.src_start) + float(nxt_src)
+        dst0 = origin + float(dst)
+        dst1 = origin + float(nxt_dst)
         if src1 - src0 < 0.03 or dst1 - dst0 < 0.03:
             continue
         spans.append(MapSpan("speech", src0, src1, dst0, dst1))

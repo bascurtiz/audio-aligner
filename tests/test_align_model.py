@@ -252,6 +252,21 @@ class TimeMapTests(unittest.TestCase):
         file_late = float(source_on_padded_wav(np.array([src_late]), trimmed.pad_sec)[0])
         self.assertAlmostEqual(file_late, 10.0, delta=0.04)
 
+    def test_offset_past_max_pad_is_rejected(self) -> None:
+        """An 800 ms offset with a 500 ms pad limit does not rewrite source time."""
+        profile = resolve_profile(None, 0, name="default", max_pad_sec=0.50)
+        late = map_from_points(self._points(lambda t: (0.80, 0.9, 0.4)), profile=profile, target_sec=8.0, in_sec=8.0)
+        self.assertTrue(late.report.get("pad_rejected"))
+        self.assertAlmostEqual(late.pad_sec, 0.0)
+        self.assertGreater(abs(float(late.report["measured_pad_sec"])), 0.50)
+        self.assertAlmostEqual(float(late.src[0]), 0.0)
+        self.assertAlmostEqual(float(late.src[-1]), 8.0)
+        kept = map_from_points(self._points(lambda t: (0.20, 0.9, 0.4)), profile=profile, target_sec=8.0, in_sec=8.0)
+        self.assertFalse(kept.report.get("pad_rejected"))
+        self.assertAlmostEqual(kept.pad_sec, 0.20, delta=0.03)
+        src_at = float(np.interp(4.0, kept.dst, kept.src))
+        self.assertAlmostEqual(src_at, 3.80, delta=0.04)
+
     def test_renderer_pad_round_trip(self) -> None:
         """Stored source time 10.000 s plus the pad is the padded-file position."""
         stored = np.array([10.0])
@@ -435,8 +450,11 @@ class GapTests(unittest.TestCase):
         self.assertLess(abs(peak_hz(late) - 330.0), 4.0)
 
     def test_phrase_offset_is_applied_once(self) -> None:
-        """A phrase 100 ms early reads 9.900 and lands at 10.000."""
+        """Query 9.900–11.900 against reference 10.000–12.000 stays a +100 ms map."""
         phrase = harmonic(SR, 2.0, 220.0)
+        click = int(1.0 * SR)
+        phrase = phrase.copy()
+        phrase[click : click + 8] = 1.0
         total = int(14.0 * SR)
         ref = np.zeros(total, dtype=np.float32)
         qry = np.zeros(total, dtype=np.float32)
@@ -457,12 +475,12 @@ class GapTests(unittest.TestCase):
                     return span.dst_start + share * (span.dst_end - span.dst_start)
             self.fail(f"no speech span covers source {src}")
 
-        start = dst_at(9.9)
-        middle = dst_at(10.9)
-        self.assertLess(abs(start - 10.0), 0.04)
-        self.assertLess(abs(middle - 11.0), 0.04)
-        self.assertGreater(abs(start - 10.1), abs(start - 10.0))
-        self.assertGreater(abs(middle - 11.1), abs(middle - 11.0))
+        self.assertLess(abs(dst_at(9.9) - 10.0), 0.03)
+        self.assertLess(abs(dst_at(11.9) - 12.0), 0.03)
+        rendered = render_gap_aware(qry, SR, spans, total, engine="linear")[:, 0]
+        i0, i1 = int(10.5 * SR), int(11.5 * SR)
+        landed = (i0 + int(np.argmax(np.abs(rendered[i0:i1])))) / SR
+        self.assertLess(abs(landed - 11.0), 0.03)
 
     def test_continuous_vocal_is_one_global_map(self) -> None:
         """Same timing stays on map_stem: one curve, no restored rest."""
