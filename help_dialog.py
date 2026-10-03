@@ -355,6 +355,14 @@ def show_help_dialog(
     body_lay.setContentsMargins(0, 0, 16, 0)
     body_lay.setSpacing(0)
 
+    # Header sits on the card, not in the scrollbar column, so the icon and
+    # lines share the card's center. The scroll body is inset on the right.
+    header = QWidget()
+    header.setStyleSheet("background: transparent; border: none;")
+    header_lay = QVBoxLayout(header)
+    header_lay.setContentsMargins(0, 0, 0, 0)
+    header_lay.setSpacing(0)
+
     if header_icon is not None and header_icon.exists():
         pix = QPixmap(str(header_icon))
         if not pix.isNull():
@@ -364,45 +372,45 @@ def show_help_dialog(
                 Qt.AspectRatioMode.KeepAspectRatio,
                 Qt.TransformationMode.SmoothTransformation,
             )
-            icon_lbl = QLabel(body_host)
+            icon_lbl = QLabel(header)
             icon_lbl.setPixmap(scaled)
             icon_lbl.setAlignment(Qt.AlignmentFlag.AlignHCenter)
             icon_lbl.setStyleSheet("background: transparent; border: none;")
             dlg._help_icon_pix = scaled  # type: ignore[attr-defined]
-            body_lay.addWidget(icon_lbl)
-            body_lay.addSpacing(6)
+            header_lay.addWidget(icon_lbl, 0, Qt.AlignmentFlag.AlignHCenter)
+            header_lay.addSpacing(6)
 
     if heading:
-        head = QLabel(heading)
+        head = QLabel(heading, header)
         head.setAlignment(Qt.AlignmentFlag.AlignHCenter)
         _style_label(head, HELP_HEADING_PX, COLORS["log_fg"], bold=True)
-        body_lay.addWidget(head)
+        header_lay.addWidget(head, 0, Qt.AlignmentFlag.AlignHCenter)
 
     if version_line:
-        body_lay.addSpacing(8)
-        ver = QLabel(version_line)
+        header_lay.addSpacing(8)
+        ver = QLabel(version_line, header)
         ver.setAlignment(Qt.AlignmentFlag.AlignHCenter)
         _style_label(ver, 12, COLORS["log_fg"], bold=True)
-        body_lay.addWidget(ver)
+        header_lay.addWidget(ver, 0, Qt.AlignmentFlag.AlignHCenter)
 
     if intro:
-        body_lay.addSpacing(4)
-        ilbl = QLabel(intro)
-        ilbl.setWordWrap(True)
-        ilbl.setMaximumWidth(text_max)
+        header_lay.addSpacing(4)
+        ilbl = QLabel(intro, header)
         ilbl.setAlignment(Qt.AlignmentFlag.AlignHCenter)
         _style_label(ilbl, HELP_BODY_PX, COLORS["fg_dim"])
-        body_lay.addWidget(ilbl)
+        header_lay.addWidget(ilbl, 0, Qt.AlignmentFlag.AlignHCenter)
 
     if repo_url:
-        body_lay.addSpacing(4)
-        body_lay.addWidget(
-            _RepoLink("View on GitHub", repo_url, parent=body_host),
+        header_lay.addSpacing(4)
+        header_lay.addWidget(
+            _RepoLink("View on GitHub", repo_url, parent=header),
             0,
             Qt.AlignmentFlag.AlignHCenter,
         )
 
-    body_lay.addSpacing(22)
+    if header_lay.count():
+        layout.addWidget(header)
+        layout.addSpacing(22)
 
     for i, (sec_title, sec_body) in enumerate(sections or []):
         if i:
@@ -500,7 +508,7 @@ def show_align_help(parent: QWidget) -> None:
         title="About Audio Aligner",
         heading="Audio Aligner",
         version_line=f"v{APP_VERSION}",
-        intro="Lock your acapella and instrumental to the original mix — tight timing, natural gaps, balanced levels.",
+        intro="Split it. Sync it. Match it.",
         header_icon=logo if logo.exists() else None,
         sections=[
             (

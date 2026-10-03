@@ -630,34 +630,50 @@ def _clock_cursor() -> QCursor:
 _CLOCK = None
 
 
+class PitchStretchError(RuntimeError):
+    """Rubber Band could not change the length without changing the pitch."""
+
+
+def _pad_or_trim(chunk: np.ndarray, n_out: int) -> np.ndarray:
+    """Match a length by cutting or adding silence. The samples stay as they are."""
+    if len(chunk) > n_out:
+        return chunk[:n_out]
+    if len(chunk) < n_out:
+        return np.pad(chunk, ((0, n_out - len(chunk)), (0, 0)))
+    return chunk
+
+
 def _fit_chunk(chunk: np.ndarray, sr: int, n_out: int) -> np.ndarray:
-    """Pitch-preserving fit of one section to a new length."""
+    """Pitch-preserving fit of one section to a new length.
+
+    Rubber Band ``--tempo`` changes the length and leaves the pitch alone.
+    A missing Rubber Band raises instead of resampling, which would shift pitch.
+    """
     if n_out < 8 or abs(len(chunk) - n_out) <= 2:
-        return chunk
+        return _pad_or_trim(chunk, n_out)
     rate = float(np.clip(len(chunk) / float(n_out), 0.5, 2.0))
+    if abs(rate - 1.0) < 1e-4:
+        return _pad_or_trim(chunk, n_out)
     try:
         from warp_align_fail_all import _ensure_rubberband_on_path
 
         _ensure_rubberband_on_path()
         import pyrubberband as pyrb
 
-        cols = []
-        for c in range(chunk.shape[1]):
-            stretched = pyrb.time_stretch(chunk[:, c].astype(np.float64), sr, rate)
-            cols.append(np.asarray(stretched, dtype=np.float32))
-        fitted = np.stack(cols, axis=1)
-    except Exception:  # noqa: BLE001 — a missing Rubber Band still previews the length
-        src_x = np.linspace(0.0, 1.0, len(chunk), endpoint=False)
-        dst_x = np.linspace(0.0, 1.0, n_out, endpoint=False)
-        fitted = np.stack(
-            [np.interp(dst_x, src_x, chunk[:, c]).astype(np.float32) for c in range(chunk.shape[1])],
-            axis=1,
-        )
-    if len(fitted) > n_out:
-        return fitted[:n_out]
-    if len(fitted) < n_out:
-        return np.pad(fitted, ((0, n_out - len(fitted)), (0, 0)))
-    return fitted
+        audio = np.ascontiguousarray(chunk, dtype=np.float64)
+        stretched = pyrb.time_stretch(audio, sr, rate)
+        fitted = np.asarray(stretched, dtype=np.float32)
+        if fitted.ndim == 1:
+            fitted = fitted[:, None]
+        if fitted.shape[1] != chunk.shape[1]:
+            raise PitchStretchError("Rubber Band changed the channel count.")
+    except PitchStretchError:
+        raise
+    except Exception as exc:  # noqa: BLE001 — surface this instead of shifting pitch
+        raise PitchStretchError(
+            "Rubber Band could not stretch this section without changing the pitch."
+        ) from exc
+    return _pad_or_trim(fitted, n_out)
 
 
 def render_moved(
@@ -665,6 +681,9 @@ def render_moved(
     sr: int,
     sections: list[Section],
     n_frames: int,
+    *,
+    strict: bool = False,
+    warnings: list[str] | None = None,
 ) -> np.ndarray:
     """Paste each section's source audio at its dragged start."""
     if audio.ndim == 1:
@@ -681,7 +700,17 @@ def render_moved(
             continue
         n_out = max(1, int(round(sec.out_dur * sr)))
         if abs(len(chunk) - n_out) > 2:
-            chunk = _fit_chunk(chunk, sr, n_out)
+            try:
+                chunk = _fit_chunk(chunk, sr, n_out)
+            except PitchStretchError as exc:
+                if strict:
+                    raise
+                if warnings is not None and not warnings:
+                    warnings.append(
+                        "Rubber Band is unavailable. Preview keeps the original pitch and length."
+                    )
+                chunk = _pad_or_trim(chunk, n_out)
+                del exc
         d0 = int(round(sec.dst0 * sr))
         if d0 < 0:
             chunk = chunk[-d0:]
@@ -723,6 +752,7 @@ class _ApplyWorker(QThread):
         sections: list[Section],
         declick: str = "rx",
         kind: str = "aca",
+        tag_folder: bool = False,
     ) -> None:
         super().__init__()
         self.folder = folder
@@ -733,11 +763,14 @@ class _ApplyWorker(QThread):
         self.sections = sections
         self.declick = declick
         self.kind = kind
+        self.tag_folder = tag_folder
 
     def run(self) -> None:  # noqa: D102
         try:
             self.step.emit("write")
-            out = render_moved(self.audio, self.sr, self.sections, self.n_frames)
+            out = render_moved(
+                self.audio, self.sr, self.sections, self.n_frames, strict=True
+            )
             tmp = self.aca_path.with_name(self.aca_path.stem + "._edit_tmp.flac")
             if tmp.exists():
                 tmp.unlink()
@@ -757,6 +790,7 @@ class _ApplyWorker(QThread):
                     self.aca_path,
                     reaper_exe=reaper_exe,
                     on_step=self.step.emit,
+                    tag_folder=self.tag_folder,
                 )
             else:
                 payload = reprocess_edited_acapella(
@@ -765,6 +799,7 @@ class _ApplyWorker(QThread):
                     reaper_exe=reaper_exe,
                     declick=self.declick,
                     on_step=self.step.emit,
+                    tag_folder=self.tag_folder,
                 )
             self.finished_ok.emit(payload)
         except Exception as exc:  # noqa: BLE001
@@ -851,44 +886,6 @@ def _step_marker_times(
     times = np.array([p[0] for p in points], dtype=float)
     lags = np.array([p[1] for p in points], dtype=float)
     return marks_where_lag_steps(np.asarray(ruler, dtype=float), times, lags)
-
-
-def _window_at(y: np.ndarray, sr: int, center: float, half: float = 5.0) -> np.ndarray:
-    mono = y.mean(axis=1) if getattr(y, "ndim", 1) == 2 else y
-    mono = np.asarray(mono, dtype=np.float32)
-    n = max(1, int(round(half * 2 * sr)))
-    out = np.zeros(n, dtype=np.float32)
-    i0 = int(round((center - half) * sr))
-    dst = 0
-    if i0 < 0:
-        dst = -i0
-        i0 = 0
-    i1 = min(len(mono), i0 + (n - dst))
-    take = i1 - i0
-    if take > 0:
-        out[dst : dst + take] = mono[i0:i1]
-    return out
-
-
-def _section_lag(reference, query, file_sr: int, out_t: float, sec: Section) -> float | None:
-    """Residual lag of one section against its reference. None when unmeasured."""
-    if reference is None or query is None:
-        return None
-    from check_alignment import CHECKPOINT_CONFIRM_LAG_SEC, checkpoint_offsets
-
-    sr = 22050
-    src_t = sec.src0 + (float(out_t) - sec.dst0) * (sec.dur / max(1e-6, sec.out_dur))
-    ref = _to_sr(_window_at(reference, file_sr, float(out_t)), file_sr, sr)
-    qry = _to_sr(_window_at(query, file_sr, src_t), file_sr, sr)
-    points = checkpoint_offsets(
-        ref, qry, sr, at_times=np.array([1.0]), confirm_sec=CHECKPOINT_CONFIRM_LAG_SEC
-    )
-    if not points:
-        return None
-    _t, lag, railed = points[0]
-    if railed:
-        return None
-    return float(lag)
 
 
 def _warp_cue_times(original: Path, duration: float) -> tuple[list[float], bool]:
@@ -1050,7 +1047,7 @@ class Timeline(QWidget):
         self._inst_out_peaks: np.ndarray | None = None
         self.sections: list[Section] = []
         self.playhead = 0.0
-        self.show_alignment = True
+        self.show_alignment = False
         self.show_bars = True
         self.bar_times: list[float] = []
         self.cue_on_bars = True
@@ -1696,6 +1693,7 @@ class SectionEditor(QWidget):
         on_apply_step=None,
         on_apply_scored=None,
         on_apply_end=None,
+        tag_folders=None,
     ) -> None:
         super().__init__(None, Qt.WindowType.Window | Qt.WindowType.FramelessWindowHint)
         self.folder = folder
@@ -1704,6 +1702,7 @@ class SectionEditor(QWidget):
         self._on_apply_step = on_apply_step
         self._on_apply_scored = on_apply_scored
         self._on_apply_end = on_apply_end
+        self._tag_folders_enabled = tag_folders
         self.setObjectName("AppRoot")
         self.setWindowTitle("Audio Aligner - Editor")
         self.resize(WIN_DEFAULT_W, WIN_DEFAULT_H)
@@ -1800,7 +1799,6 @@ class SectionEditor(QWidget):
         )
         self.with_demucs.toggled.connect(lambda _checked: self._sync_gains())
         self.align_lines = QCheckBox("Alignment lines")
-        self.align_lines.setChecked(True)
         self.align_lines.setToolTip(
             "Lines mark the same moment on both lanes.\n"
             "Drag a section and the wave moves against them."
@@ -1829,14 +1827,6 @@ class SectionEditor(QWidget):
         self.more_btn.setEnabled(False)
         self.more_btn.setToolTip("Split the longest phrases into shorter sections.")
         self.more_btn.clicked.connect(lambda: self._retarget_sections(1))
-        self.halfway_btn = QPushButton("Halfway")
-        self.halfway_btn.setEnabled(False)
-        self.halfway_btn.setToolTip(
-            "Pulls the section under the playhead halfway toward the reference.\n"
-            "Only a hit that is already close is moved.\n"
-            "A slip of a beat is left where it is."
-        )
-        self.halfway_btn.clicked.connect(self._pull_halfway)
         self.apply_btn = QPushButton("Apply")
         self.apply_btn.setEnabled(False)
         self.apply_btn.setToolTip(
@@ -1853,7 +1843,6 @@ class SectionEditor(QWidget):
         row.addWidget(self.sections_lbl)
         row.addWidget(self.fewer_btn)
         row.addWidget(self.more_btn)
-        row.addWidget(self.halfway_btn)
         row.addWidget(self.reset_btn)
         row.addWidget(self.apply_btn)
 
@@ -1932,7 +1921,6 @@ class SectionEditor(QWidget):
         for widget in (
             self.fewer_btn,
             self.more_btn,
-            self.halfway_btn,
             self.aca_radio,
             self.inst_radio,
             self.with_demucs,
@@ -2045,43 +2033,6 @@ class SectionEditor(QWidget):
         n = len(self.timeline.sections)
         self.fewer_btn.setEnabled(ready and n > 1)
         self.more_btn.setEnabled(ready and n > 0)
-        self.halfway_btn.setEnabled(ready and n > 0)
-
-    def _pull_halfway(self) -> None:
-        if self._busy or self._data is None or not self.timeline.editing():
-            return
-        t = float(self.timeline.playhead)
-        sections = self.timeline.sections
-        idx = next((i for i, sec in enumerate(sections) if sec.dst0 <= t <= sec.dst1), None)
-        if idx is None:
-            self.status.setText("Put the playhead inside a section, then pull it halfway.")
-            return
-        data = self._data
-        if self.timeline.stem == "inst":
-            ref, qry = data.get("demucs_inst"), data.get("inst")
-        else:
-            ref, qry = data.get("vox"), data.get("aca")
-        lag = _section_lag(ref, qry, int(data["sr"]), t, sections[idx])
-        if lag is None or abs(lag) > 0.040:
-            self.status.setText("That hit is a beat away. Left it.")
-            return
-        sec = sections[idx]
-        span = sec.dur
-        src0 = sec.src0 - 0.5 * float(lag)
-        src0 = max(0.0, min(src0, max(0.0, float(data["duration"]) - span)))
-        if abs(src0 - sec.src0) < 0.0005:
-            self.status.setText("That section is already on the reference.")
-            return
-        self._push_undo()
-        sec.src0 = src0
-        sec.src1 = src0 + span
-        self._invalidate_aca_play()
-        if self._is_playing():
-            self._ensure_aca_play()
-        self.timeline.update()
-        self._sync_edit_buttons()
-        ms = abs(0.5 * float(lag)) * 1000.0
-        self.status.setText(f"Pulled the section {ms:.0f} ms toward the reference.")
 
     def _note_edit(self) -> None:
         self._pending_undo = self._section_snapshot()
@@ -2353,7 +2304,12 @@ class SectionEditor(QWidget):
             self._aca_key = key
             self._play.set_aca(None)
             return
-        moved = render_moved(src, data["sr"], self.timeline.sections, data["n_frames"])
+        notes: list[str] = []
+        moved = render_moved(
+            src, data["sr"], self.timeline.sections, data["n_frames"], warnings=notes
+        )
+        if notes:
+            self.status.setText(notes[0])
         moved = np.ascontiguousarray(self._match_play_rate(self._as_stereo(moved)), dtype=np.float32)
         self._aca_play = moved
         self._aca_key = key
@@ -2600,16 +2556,21 @@ class SectionEditor(QWidget):
         if dest is None or audio is None:
             self.status.setText("This stem is missing.")
             return
+        if self._tag_folders():
+            folder_line = (
+                "If the new score passes, the folder is renamed from _[fail] to _[pass]. "
+                "If it fails, the other way. Close REAPER first if it is open."
+            )
+        else:
+            folder_line = "The folder name is left as it is. Close REAPER first if it is open."
         answer = QMessageBox.question(
             self,
             "Apply section edit",
-            prompt
-            + f"{dest.name}\n"
-            + "The folder name is left as it is. Close REAPER first if it is open.",
+            prompt + f"{dest.name}\n" + folder_line,
         )
         if answer != QMessageBox.StandardButton.Yes:
             return
-        if self._on_apply_begin is not None and not self._on_apply_begin(self.folder.name):
+        if self._on_apply_begin is not None and not self._on_apply_begin(self.folder.name, stem):
             QMessageBox.information(
                 self,
                 "Busy",
@@ -2639,6 +2600,7 @@ class SectionEditor(QWidget):
             sections,
             self._declick,
             stem,
+            self._tag_folders(),
         )
         worker.step.connect(self._relay_apply_step)
         worker.finished_ok.connect(self._on_apply_done)
@@ -2681,7 +2643,27 @@ class SectionEditor(QWidget):
         self._apply_summary = (
             f"Re-aligned. Acapella {aca or '—'}, instrumental {inst or '—'}."
         )
+        self._follow_renamed_folder(payload)
         self._start_loader(self._on_reloaded)
+
+    def _tag_folders(self) -> bool:
+        fn = self._tag_folders_enabled
+        if fn is None:
+            return False
+        try:
+            return bool(fn())
+        except Exception:  # noqa: BLE001 — a settings read must not block the edit
+            return False
+
+    def _follow_renamed_folder(self, payload: dict) -> None:
+        moved = str(payload.get("moved_to") or "")
+        if not moved:
+            return
+        new_folder = Path(moved)
+        if not new_folder.is_dir() or new_folder == self.folder:
+            return
+        self.folder = new_folder
+        self.folder_lbl.setText(new_folder.name)
 
     def _on_reloaded(self, data: dict) -> None:
         applied = getattr(self, "_applied_stem", "aca")
@@ -2769,6 +2751,7 @@ def open_section_editor(
     on_apply_step=None,
     on_apply_scored=None,
     on_apply_end=None,
+    tag_folders=None,
 ) -> SectionEditor:
     # Stay a top-level window. Parenting onto the aligner creates a native
     # child that can take down the host when the frameless frame is shown.
@@ -2780,6 +2763,7 @@ def open_section_editor(
         on_apply_step=on_apply_step,
         on_apply_scored=on_apply_scored,
         on_apply_end=on_apply_end,
+        tag_folders=tag_folders,
     )
     win.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
     win.setAttribute(Qt.WidgetAttribute.WA_QuitOnClose, False)

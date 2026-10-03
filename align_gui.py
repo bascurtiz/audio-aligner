@@ -730,7 +730,9 @@ class MainWindow(QWidget):
         header = QHBoxLayout()
         header.setContentsMargins(0, 0, 0, 0)
         header.setSpacing(6)
-        subtitle = QLabel("Split it. Sync it. Match it.")
+        subtitle = QLabel(
+            "Split it. Sync it. Match it. - Aligns acapella & instrumental to the original mix, then checks the result."
+        )
         subtitle.setObjectName("HeaderDesc")
         subtitle.setWordWrap(False)
         header.addWidget(subtitle, 0, Qt.AlignmentFlag.AlignVCenter)
@@ -775,7 +777,7 @@ class MainWindow(QWidget):
         self.progress_pct.setStyleSheet(
             f"color: {COLORS['log_fg']}; background: transparent; font-size: 12px; font-weight: 600;"
         )
-        self.progress_eta = QLabel("ETA —")
+        self.progress_eta = QLabel("Idle")
         self.progress_eta.setObjectName("ProgressReadout")
         self.progress_eta.setFont(readout_font)
         self.progress_eta.setAlignment(
@@ -783,7 +785,7 @@ class MainWindow(QWidget):
         )
         eta_width = max(
             readout.horizontalAdvance(sample)
-            for sample in ("ETA —", "ETA 59s", "ETA 59m 59s", "ETA 59h 59m")
+            for sample in ("Idle", "ETA —", "ETA 59s", "ETA 59m 59s", "ETA 59h 59m")
         )
         readout_width = eta_width + 18
         self.progress_pct.setAlignment(
@@ -2068,17 +2070,16 @@ class MainWindow(QWidget):
         worker.start()
         self._sync_progress_button()
 
-    def _open_progress_modal(self, mode: str, folder_total: int) -> None:
+    def _open_progress_modal(self, mode: str, folder_total: int, *, stem: str = "aca") -> None:
         from progress_modal import ProgressModal
 
         self._close_progress_modal()
-        tagging = self.move_on_pass.isChecked() and not self.dry_run.isChecked()
         modal = ProgressModal(
             self,
             mode=mode,
             folder_total=folder_total,
-            tagging=tagging,
             gaps_cut=self.gaps_cut.isChecked(),
+            stem=stem,
         )
         modal.stop_requested.connect(self._stop)
         modal.open_over(self)
@@ -2117,7 +2118,7 @@ class MainWindow(QWidget):
         if total <= 0:
             self.progress.setValue(0)
             self.progress_pct.setText("0%")
-            self.progress_eta.setText("ETA —")
+            self.progress_eta.setText("Idle")
             return
         frac = (done + (within if self._song_open else 0.0)) / total
         frac = max(0.0, min(1.0, frac))
@@ -2172,11 +2173,11 @@ class MainWindow(QWidget):
             return
         modal.reveal(self)
 
-    def _editor_apply_begin(self, name: str) -> bool:
+    def _editor_apply_begin(self, name: str, stem: str = "aca") -> bool:
         if self.worker is not None and self.worker.isRunning():
             return False
         self._editor_busy = True
-        self._open_progress_modal("edit", 1)
+        self._open_progress_modal("edit", 1, stem=stem)
         modal = self._progress_modal
         if modal is not None:
             modal.set_folder(name, 1, 1)
@@ -2649,6 +2650,7 @@ class MainWindow(QWidget):
                 on_apply_step=self._editor_apply_step,
                 on_apply_scored=self._editor_apply_scored,
                 on_apply_end=self._editor_apply_end,
+                tag_folders=lambda: self.move_on_pass.isChecked() and not self.dry_run.isChecked(),
             )
         except Exception as exc:  # noqa: BLE001
             QMessageBox.critical(self, "Could not open editor", f"{type(exc).__name__}: {exc}")
@@ -2738,7 +2740,7 @@ class MainWindow(QWidget):
         self._song_open = False
         self.progress.setValue(100)
         self.progress_pct.setText("100%")
-        self.progress_eta.setText(format_eta(0))
+        self.progress_eta.setText("Idle")
         passed = sum(1 for r in rows if r.get("verdict") == "pass")
         if self._inplace_update and rows:
             name = rows[0].get("folder") or ""
@@ -2759,7 +2761,7 @@ class MainWindow(QWidget):
         self._sync_progress_button()
         self._progress_timer.stop()
         self._song_open = False
-        self.progress_eta.setText("ETA —")
+        self.progress_eta.setText("Idle")
         self._inplace_update = False
         self._inplace_stem = None
         self.status.setText("Failed")

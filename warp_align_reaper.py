@@ -725,12 +725,14 @@ def reprocess_edited_acapella(
     reaper_exe: Path,
     declick: str = "rx",
     on_step=None,
+    tag_folder: bool = False,
 ) -> dict:
     """Élastique, loudness-match, and re-score a manually placed acapella.
 
     The edited file is the vocal placement. Gap placement is not run again.
     Residual élastique uses the Demucs vocal. The instrumental is left as it is.
-    The folder is not renamed. The returned dict is the new row for the list.
+    The folder is renamed when ``tag_folder`` is set and the score is pass or fail.
+    The returned dict is the new row for the list.
     """
     _aca_bak, _inst_src, orig = find_backup_stems(folder)
     if not aca_dest.is_file():
@@ -811,7 +813,7 @@ def reprocess_edited_acapella(
 
     # After the gain. A click removed first would be raised again with the vocal.
     _apply_aca_declick(aca_dest, declick_plan.method, reaper_exe)
-    return _scored_edit_row(folder, notes, on_step)
+    return _scored_edit_row(folder, notes, on_step, tag_folder=tag_folder)
 
 
 def reprocess_edited_instrumental(
@@ -820,12 +822,14 @@ def reprocess_edited_instrumental(
     *,
     reaper_exe: Path,
     on_step=None,
+    tag_folder: bool = False,
 ) -> dict:
     """Élastique, loudness-match, and re-score a manually placed instrumental.
 
     The edited file is the placement. Residual élastique uses the Demucs
     instrumental and the transient stretch. The acapella is left as it is.
-    The instrumental is not de-clicked. The folder is not renamed.
+    The instrumental is not de-clicked. The folder is renamed when
+    ``tag_folder`` is set and the score is pass or fail.
     """
     _aca_bak, _inst_src, orig = find_backup_stems(folder)
     if not inst_dest.is_file():
@@ -913,11 +917,14 @@ def reprocess_edited_instrumental(
     except Exception as exc:  # noqa: BLE001
         notes.append(f"loudness_match_skip:{type(exc).__name__}:{exc}")
 
-    return _scored_edit_row(folder, notes, on_step)
+    return _scored_edit_row(folder, notes, on_step, tag_folder=tag_folder)
 
 
-def _scored_edit_row(folder: Path, notes: list[str], on_step) -> dict:
-    """Re-score both stems after a section edit. The folder name stays."""
+def _scored_edit_row(folder: Path, notes: list[str], on_step, *, tag_folder: bool = False) -> dict:
+    """Re-score both stems after a section edit.
+
+    When ``tag_folder`` is set, a pass or fail renames the folder to match.
+    """
     aca, inst, orig2, scan_notes = scan_folder(folder)
     if not aca or not inst or not orig2:
         notes.append(f"post_scan:{scan_notes}")
@@ -964,9 +971,23 @@ def _scored_edit_row(folder: Path, notes: list[str], on_step) -> dict:
     )
     notes.append(stem_notes)
     notes.append(f"check={verdict} corr={corr:.3f} drift={drift:.1f}ms; {check_notes}")
-    return {
-        "folder": folder.name,
-        "path": str(folder),
+    live = folder
+    moved_to = ""
+    if tag_folder and combined in ("pass", "fail"):
+        _emit_step(on_step, "tag")
+        try:
+            dest = tag_folder_verdict(folder, combined)
+        except FileExistsError:
+            notes.append("dest_exists")
+        except OSError as exc:
+            notes.append(f"rename_failed:{exc}")
+        else:
+            if dest is not None:
+                live = dest
+                moved_to = str(dest)
+    row = {
+        "folder": live.name,
+        "path": str(live),
         "verdict": combined,
         "aca_verdict": aca_verdict,
         "inst_verdict": inst_verdict,
@@ -978,6 +999,9 @@ def _scored_edit_row(folder: Path, notes: list[str], on_step) -> dict:
         "inst_checkpoints": inst_points,
         "notes": "; ".join(notes),
     }
+    if moved_to:
+        row["moved_to"] = moved_to
+    return row
 
 
 def _emit_step(on_step, step_id: str) -> None:

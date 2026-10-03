@@ -65,26 +65,30 @@ ALIGN_STEPS: list[tuple[str, str, str]] = [
     ("silence", "SILENCE", "Putting rests back in the acapella"),
     ("align", "ALIGN", "Stretching both stems to the Demucs splits"),
     ("loudness", "LOUDNESS", "Matching loudness to the Demucs splits"),
+    ("score", "SCORE", "Scoring alignment"),
 ]
 
-EDIT_STEPS: list[tuple[str, str, str]] = [
-    ("write", "WRITE", "Writing the edited acapella"),
-    ("align", "ALIGN", "Warping the acapella to the vocal"),
-    ("loudness", "LOUDNESS", "Matching loudness"),
-    ("score", "SCORE", "Scoring the edited acapella"),
-]
+def edit_steps(stem: str) -> list[tuple[str, str, str]]:
+    """Headlines for a section edit. ``stem`` is ``aca`` or ``inst``."""
+    if stem == "inst":
+        name, ref = "instrumental", "Demucs instrumental"
+    else:
+        name, ref = "acapella", "Demucs vocal"
+    return [
+        ("write", "WRITE", f"Writing the edited {name}"),
+        ("align", "ALIGN", f"Warping the {name} to the {ref}"),
+        ("loudness", "LOUDNESS", f"Matching {name} loudness"),
+        ("score", "SCORE", f"Scoring the edited {name}"),
+    ]
 
 CHECK_STEPS: list[tuple[str, str, str]] = [
     ("scan", "SCAN", "Reading stems"),
     ("score", "SCORE", "Checking alignment"),
-    ("tag", "TAG", "Updating folder name"),
 ]
 
-# Extra step ids that finish the last bar and only change the headline
+# Repair stays on the stretch. Renaming the folder is too brief to be its own step.
 ALIGN_TRAILING = {
     "repair": "Correcting drift the first warp left behind",
-    "score": "Scoring alignment",
-    "tag": "Updating folder name",
 }
 
 def _step_color(step_id: str, *, is_last: bool) -> str:
@@ -189,7 +193,7 @@ class _ProcessGlyph(QWidget):
             "silence": self._paint_silence,
             "align": self._paint_align,
             "loudness": self._paint_loudness,
-            "score": self._paint_align,
+            "score": self._paint_score,
         }.get(self._step_id)
         if scene is not None:
             scene(p)
@@ -310,6 +314,46 @@ class _ProcessGlyph(QWidget):
             x = x0 + i * spacing
             p.drawLine(QPointF(x, baseline), QPointF(x, baseline - h))
 
+    def _paint_score(self, p: QPainter) -> None:
+        """A ring fills, then a check draws. Not the align bars."""
+        t = self._t
+        s = float(self.width())
+        cx = cy = s / 2
+        accent = self._accent()
+        radius = 22.0
+        rect = QRectF(cx - radius, cy - radius, radius * 2, radius * 2)
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.setPen(_pen(self._muted(), 2.2))
+        p.drawEllipse(rect)
+        if self._state != "pending" and t > 0.01:
+            span = int(round(-360 * 16 * min(1.0, t)))
+            p.setPen(_pen(accent, 2.4))
+            p.drawArc(rect, 90 * 16, span)
+        if self._state == "pending" or t <= 0.5:
+            return
+        u = min(1.0, (t - 0.5) / 0.5)
+        p.setPen(_pen(accent, 2.6))
+        start = QPointF(cx - 8, cy + 1)
+        knee = QPointF(cx - 2, cy + 8)
+        end = QPointF(cx + 10, cy - 7)
+        short = min(1.0, u / 0.4)
+        p.drawLine(
+            start,
+            QPointF(
+                start.x() + (knee.x() - start.x()) * short,
+                start.y() + (knee.y() - start.y()) * short,
+            ),
+        )
+        if u > 0.4:
+            long = (u - 0.4) / 0.6
+            p.drawLine(
+                knee,
+                QPointF(
+                    knee.x() + (end.x() - knee.x()) * long,
+                    knee.y() + (end.y() - knee.y()) * long,
+                ),
+            )
+
 
 class _Stepper(QWidget):
     def __init__(
@@ -411,17 +455,6 @@ class _Stepper(QWidget):
     def active_index(self) -> int:
         return self._active
 
-    def keep_animating(self) -> None:
-        """Stay on the last glyph and keep it moving until the next song."""
-        if not self._with_icons or not self._steps:
-            return
-        last = len(self._steps) - 1
-        if self._active != last:
-            self.set_active(last)
-            return
-        if self.isVisible() and not self._pulse.isActive():
-            self._pulse.start()
-
     def set_active(self, index: int) -> None:
         self._active = max(0, min(index, len(self._steps)))
         self._phase = 0.0
@@ -467,8 +500,8 @@ class ProgressModal(QDialog):
         *,
         mode: str = "align",
         folder_total: int = 1,
-        tagging: bool = True,
         gaps_cut: bool = True,
+        stem: str = "aca",
     ) -> None:
         super().__init__(parent)
         self.setObjectName("ProgressModal")
@@ -482,9 +515,9 @@ class ProgressModal(QDialog):
 
         self._mode = mode if mode in {"check", "edit", "align"} else "align"
         if self._mode == "check":
-            self._steps = [s for s in CHECK_STEPS if tagging or s[0] != "tag"]
+            self._steps = list(CHECK_STEPS)
         elif self._mode == "edit":
-            self._steps = list(EDIT_STEPS)
+            self._steps = edit_steps(stem)
         else:
             self._steps = list(ALIGN_STEPS)
             if not gaps_cut:
@@ -716,13 +749,6 @@ class ProgressModal(QDialog):
                 self._stepper.set_active(align_idx)
             self._note_step("align")
             return
-        if step_id in ALIGN_TRAILING and self._mode == "align":
-            # Score and rename have no glyph. Keep loudness moving until the next song.
-            self._stepper.keep_animating()
-            self._headline.setText(ALIGN_TRAILING[step_id])
-            self._refresh_folder_label()
-            self._note_step(step_id)
-            return
 
         idx = self._id_to_index.get(step_id)
         if idx is None:
@@ -744,9 +770,8 @@ class ProgressModal(QDialog):
     def _progress_step_ids(self) -> list[str]:
         ids = [sid for sid, _, _ in self._steps]
         if self._mode == "align":
-            for extra in ("score", "tag"):
-                if extra not in ids:
-                    ids.append(extra)
+            if "score" not in ids:
+                ids.append("score")
         return ids
 
     def _note_step(self, step_id: str) -> None:
