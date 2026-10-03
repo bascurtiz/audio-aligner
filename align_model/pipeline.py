@@ -214,7 +214,43 @@ def _model_phrase(
         if src1 - src0 < 0.03 or dst1 - dst0 < 0.03:
             continue
         spans.append(MapSpan("speech", src0, src1, dst0, dst1))
-    return spans or None
+    return _cover_placed_edges(spans, unit) or None
+
+
+def _cover_placed_edges(spans: list[MapSpan], unit: PhraseUnit) -> list[MapSpan]:
+    """Keep the placed phrase where the local map has no markers.
+
+    Evidence windows sit inside the phrase, so the solved map often stops
+    before the end the detector already measured. That uncovered tail is
+    still the phrase. Leaving it out turns the end of the line into the rest.
+    """
+    if not spans:
+        return spans
+    out = list(spans)
+    first = out[0]
+    if first.src_start > unit.src_start + 0.03 and first.dst_start > unit.dst_start + 0.03:
+        out.insert(
+            0,
+            MapSpan(
+                "speech",
+                float(unit.src_start),
+                float(first.src_start),
+                float(unit.dst_start),
+                float(first.dst_start),
+            ),
+        )
+    last = out[-1]
+    if unit.src_end > last.src_end + 0.03 and unit.dst_end > last.dst_end + 0.03:
+        out.append(
+            MapSpan(
+                "speech",
+                float(last.src_end),
+                float(unit.src_end),
+                float(last.dst_end),
+                float(unit.dst_end),
+            )
+        )
+    return out
 
 
 def _with_silence(pieces: list[MapSpan], duration: float) -> list[MapSpan]:
@@ -268,6 +304,8 @@ def map_vocal_gaps(
             in_sec=len(aca) / sr,
         )
         stem.report["gap_notes"] = notes
+        stem.report["global_pad_sec"] = float(stem.pad_sec)
+        stem.report["phrase_start_offset"] = None
         return stem
     pieces: list[MapSpan] = []
     used_model = False
@@ -302,6 +340,15 @@ def map_vocal_gaps(
     report["gap_notes"] = notes
     report["kind"] = "vocal"
     report["profile"] = profile.name
+    # Where phrase 1 was placed, and the robust offset of the speech lag
+    # series. The first is a detector result. The second is a fit across
+    # every phrase, so a bad first phrase must not be treated as the
+    # render pad. The renderer still uses the phrase offset until a
+    # benchmark shows that choice moves the vocal.
+    phrase_start_offset = float(units[0].start_offset)
+    global_pad_sec = float(measured.offset_sec)
+    report["phrase_start_offset"] = phrase_start_offset
+    report["global_pad_sec"] = global_pad_sec
     # The phrase renderer consumes spans directly. src/dst here describe speech pins.
     src = []
     dst = []
@@ -320,7 +367,7 @@ def map_vocal_gaps(
         scores=scores,
         src=np.asarray(src, dtype=float),
         dst=np.asarray(dst, dtype=float),
-        pad_sec=float(units[0].start_offset),
+        pad_sec=phrase_start_offset,
         report=report,
         kind="vocal",
         gap_units=units,

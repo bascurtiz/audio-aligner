@@ -5,6 +5,7 @@ from __future__ import annotations
 import numpy as np
 
 from align_model.decompose import decompose
+from align_model.gaps import render_gap_aware
 from align_model.params import resolve_profile
 from align_model.pipeline import map_stem, map_vocal_gaps
 
@@ -179,6 +180,141 @@ def case_gaps() -> dict:
         "drift": float(stem.report.get("drift") or 0.0),
     }
     return out
+
+
+def _speech_smoothness(times: np.ndarray, lags: np.ndarray) -> float:
+    times = np.asarray(times, dtype=float).reshape(-1)
+    lags = np.asarray(lags, dtype=float).reshape(-1)
+    if times.size < 3 or times.size != lags.size:
+        return 0.0
+    order = np.argsort(times)
+    times = times[order]
+    lags = lags[order]
+    keep = np.concatenate([[True], np.diff(times) > 1e-4])
+    return warp_smoothness(times[keep], lags[keep])
+
+
+def _peak_hz(y: np.ndarray, sr: int) -> float:
+    y = np.asarray(y, dtype=float).reshape(-1)
+    if y.size < 16:
+        return 0.0
+    spec = np.abs(np.fft.rfft(y))
+    return float(np.fft.rfftfreq(y.size, 1.0 / sr)[int(np.argmax(spec))])
+
+
+def case_continuous_vocal() -> dict:
+    """Test A. Same-timing vocal goes through the global map, not the gap path."""
+    ref = harmonic(SR, 8.0, 220.0)
+    stem = map_stem(
+        ref,
+        ref.copy(),
+        SR,
+        kind="vocal",
+        profile=_profile(ref),
+        target_sec=len(ref) / SR,
+        in_sec=len(ref) / SR,
+    )
+    silence = [span for span in stem.spans if getattr(span, "kind", "") == "silence"]
+    return {
+        "name": "continuous_vocal",
+        "category": "global",
+        "errors": lag_errors(stem.times, stem.lags, lambda t: 0.0),
+        "jumps": [float(j.get("time", 0.0)) for j in stem.report.get("jumps") or []],
+        "smoothness": warp_smoothness(stem.times, stem.lags),
+        "monotonic": bool(len(stem.src) < 2 or np.all(np.diff(stem.src) >= -1e-3)),
+        "offset": float(stem.report.get("offset_sec") or 0.0),
+        "drift": float(stem.report.get("drift") or 0.0),
+        "n_phrases": len(stem.gap_units),
+        "silence": [(float(span.dst_start), float(span.dst_end)) for span in silence],
+        "max_abs_lag": float(np.max(np.abs(stem.lags))) if len(stem.lags) else 1e9,
+    }
+
+
+def case_stripped_vocal() -> dict:
+    """Test B. A short breath must not inherit the long reference rest.
+
+    The acapella keeps a breath the phrase detector can see. The reference
+    rest is much longer. Phrase B has to land on that rest.
+    """
+    phrase = 2.4
+    breath = 0.6
+    rest = 2.6
+    a = harmonic(SR, phrase, 196.0)
+    b = harmonic(SR, phrase, 330.0)
+    gap_a = np.zeros(int(breath * SR), dtype=np.float32)
+    gap_r = np.zeros(int(rest * SR), dtype=np.float32)
+    ref = np.concatenate([a, gap_r, b])
+    qry = np.concatenate([a, gap_a, b])
+    stem = map_vocal_gaps(qry, ref, SR, profile=_profile(ref, max_lag=1.2), target_sec=len(ref) / SR)
+    units = list(stem.gap_units)
+    b_reference = phrase + rest
+    if len(units) >= 2:
+        breath_left = float(units[1].src_start - units[0].src_end)
+        chained = float(units[0].dst_end) + max(0.0, breath_left)
+        phrase_dst = [float(unit.dst_start) for unit in units[:2]]
+    else:
+        chained = b_reference
+        phrase_dst = [float(unit.dst_start) for unit in units]
+    silence = [span for span in stem.spans if span.kind == "silence"]
+    speech = [span for span in stem.spans if span.kind == "speech"]
+    durations = [float(span.dst_end - span.dst_start) for span in silence]
+    rendered = render_gap_aware(qry, SR, stem.spans, len(ref), engine="linear")[:, 0]
+
+    def window(t0: float, t1: float) -> np.ndarray:
+        i0 = int(t0 * SR)
+        i1 = int(t1 * SR)
+        return rendered[i0:i1]
+
+    # 3.1s is inside the reference rest and inside the slot B would occupy
+    # if it kept the short breath. 5.7s is inside reference B and past that
+    # shortened slot. The tail windows are the ends the local map used to drop.
+    stall = window(3.1, 3.6)
+    between = next((span for span in silence if span.dst_start <= 3.3 <= span.dst_end), None)
+    a_speech = [span for span in speech if between is None or span.dst_end <= between.dst_start + 0.05]
+    b_speech = [span for span in speech if between is not None and span.dst_start >= between.dst_end - 0.05]
+    if len(phrase_dst) >= 2:
+        start_err = np.array(
+            [abs(phrase_dst[0] - 0.0), abs(phrase_dst[1] - b_reference)],
+            dtype=float,
+        )
+    else:
+        start_err = np.array([1.0], dtype=float)
+    return {
+        "name": "stripped_vocal",
+        "category": "gaps",
+        "errors": {
+            "mae": float(np.mean(start_err)),
+            "rmse": float(np.sqrt(np.mean(start_err**2))),
+            "p95": float(np.max(start_err)),
+            "max": float(np.max(start_err)),
+        },
+        "jumps": [
+            float(j.get("time", 0.0)) if isinstance(j, dict) else float(getattr(j, "time", 0.0))
+            for j in stem.report.get("jumps") or []
+        ],
+        "smoothness": _speech_smoothness(stem.times, stem.lags),
+        "monotonic": _spans_monotonic(stem.spans),
+        "offset": float(stem.report.get("offset_sec") or 0.0),
+        "drift": float(stem.report.get("drift") or 0.0),
+        "n_phrases": len(units),
+        "phrase_dst": phrase_dst,
+        "b_reference": b_reference,
+        "b_if_chained": chained,
+        "silence": [(float(span.dst_start), float(span.dst_end)) for span in silence],
+        "durations": durations,
+        "stall_start": float(between.dst_start) if between is not None else 0.0,
+        "speech_a_end": float(max(span.dst_end for span in a_speech)) if a_speech else 0.0,
+        "speech_b_end": float(max(span.dst_end for span in b_speech)) if b_speech else 0.0,
+        "stall_peak": float(np.max(np.abs(stall))) if stall.size else 1.0,
+        "pitch_a": _peak_hz(window(0.55, 1.25), SR),
+        "pitch_b": _peak_hz(window(5.7, 6.3), SR),
+        "pitch_a_tail": _peak_hz(window(2.00, 2.25), SR),
+        "pitch_b_tail": _peak_hz(window(6.90, 7.15), SR),
+        "pad_sec": float(stem.pad_sec),
+        "phrase_start_offset": stem.report.get("phrase_start_offset"),
+        "global_pad_sec": stem.report.get("global_pad_sec"),
+        "gap_notes": list(stem.report.get("gap_notes") or []),
+    }
 
 
 def _spans_monotonic(spans) -> bool:
@@ -407,6 +543,8 @@ CASES = (
     case_drift,
     case_nonlinear,
     case_gaps,
+    case_continuous_vocal,
+    case_stripped_vocal,
     case_repeated,
     case_tempo_change,
     case_noise,

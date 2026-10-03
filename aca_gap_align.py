@@ -152,8 +152,15 @@ def find_active_segments(
     peak = float(np.max(env) or 0.0)
     if peak < 1e-9:
         return []
-    thr = peak * (10 ** (silence_db / 20.0))
-    thr = max(thr, float(np.percentile(env, 20)) * 1.5, 1e-4)
+    db_thr = peak * (10 ** (silence_db / 20.0))
+    floor = float(np.percentile(env, 20))
+    # The 20th percentile is a noise floor only when the file is not mostly
+    # singing. On a dense vocal it is the phrase itself, and 1.5× that value
+    # sits above the peak, so every rest collapses into one segment.
+    if floor < peak * 0.35:
+        thr = max(db_thr, floor * 1.5, 1e-4)
+    else:
+        thr = max(db_thr, 1e-4)
     active = env >= thr
     min_sil = max(1, int(min_silence_sec * sr / hop))
     min_act = max(1, int(min_active_sec * sr / hop))

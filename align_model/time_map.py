@@ -112,6 +112,7 @@ def solve_constrained_lag_path(
     max_stretch: float = MAX_STRETCH,
     max_accel: float = MAX_ACCEL,
     high_conf: float = 0.45,
+    rate_stats: dict | None = None,
     high_margin_min: float = HIGH_MARGIN,
     medium_conf: float = 0.25,
     medium_margin: float = 0.04,
@@ -250,7 +251,11 @@ def solve_constrained_lag_path(
         b = int(prev[i, b])
         if b < 0:
             b = int(np.argmin(np.abs(grid - pull[i - 1])))
-    return _clamp_accel(t, out, max_accel)
+    limited, stats = _clamp_accel(t, out, max_accel)
+    if rate_stats is not None:
+        rate_stats.clear()
+        rate_stats.update(stats)
+    return limited
 
 
 def constrained_dtw(*args, **kwargs):
@@ -265,20 +270,28 @@ def data_cost_row(i, grid, pull, conf, beat_w, scale) -> np.ndarray:
     return cost
 
 
-def _clamp_accel(times: np.ndarray, lags: np.ndarray, max_step: float) -> np.ndarray:
+def _clamp_accel(times: np.ndarray, lags: np.ndarray, max_step: float) -> tuple[np.ndarray, dict]:
+    """Limit how fast the stretch rate may turn, then rebuild the lag.
+
+    A step of at least 40 ms is left alone. The returned stats compare this
+    rebuilt map with the path that entered the limiter.
+    """
     t = np.asarray(times, dtype=float)
     lag = np.asarray(lags, dtype=float).copy()
+    empty = {"max_sec": 0.0, "rms_sec": 0.0, "n_modified": 0}
     if len(t) < 3:
-        return _monotonic_lag(t, lag)
+        return _monotonic_lag(t, lag), empty
     src = t - lag
     rates = np.diff(src) / np.maximum(np.diff(t), 1e-6)
     dlag = np.diff(lag)
+    n_modified = 0
     for i in range(1, len(rates)):
         if abs(float(dlag[i])) >= 0.04 or abs(float(dlag[i - 1])) >= 0.04:
             continue
         delta = float(rates[i] - rates[i - 1])
         if abs(delta) > max_step:
             rates[i] = rates[i - 1] + np.sign(delta) * max_step
+            n_modified += 1
     src_out = np.empty_like(src)
     src_out[0] = src[0]
     for i, rate in enumerate(rates):
@@ -287,7 +300,14 @@ def _clamp_accel(times: np.ndarray, lags: np.ndarray, max_step: float) -> np.nda
         if abs(float(lag[i] - lag[i - 1])) >= 0.04:
             src_out[i] = src[i]
         src_out[i] = max(float(src_out[i]), float(src_out[i - 1]) + 1e-4)
-    return t - src_out
+    limited = t - src_out
+    err = limited - lag
+    stats = {
+        "max_sec": float(np.max(np.abs(err))),
+        "rms_sec": float(np.sqrt(np.mean(err ** 2))),
+        "n_modified": int(n_modified),
+    }
+    return limited, stats
 
 
 def _monotonic_lag(times: np.ndarray, lags: np.ndarray) -> np.ndarray:
@@ -363,7 +383,8 @@ def src_dst_from_lags(
     The residual is the full lag with the constant offset removed. Adding
     that offset as front padding puts these coordinates on the file the
     renderer opens. ``map_stem`` subtracts the pad before storing ``src``,
-    so stored source times are original-stem times.
+    so stored source times are original-stem times. Every returned marker
+    keeps that residual: padded source and ``dst - lag`` agree.
     """
     t = np.asarray(times, dtype=float).reshape(-1)
     lag = np.asarray(lags, dtype=float).reshape(-1)
@@ -387,21 +408,14 @@ def src_dst_from_lags(
     if len(dst) < 2:
         dst = np.array([0.0, target_sec])
     lag_at = np.interp(dst, t, lag, left=float(lag[0]), right=float(lag[-1]))
+    # The offset was already removed from ``lag``. Integrating rates from a
+    # pinned src[0] = 0 walks every later marker off this residual.
     src = dst - lag_at
-    src[0] = 0.0
     for i in range(1, len(src)):
-        src[i] = max(float(src[i]), float(src[i - 1]) + 1e-3)
-    rates = np.diff(src) / np.maximum(np.diff(dst), 1e-6)
-    for i in range(1, len(rates)):
-        delta = float(rates[i] - rates[i - 1])
-        if abs(delta) > MAX_ACCEL:
-            rates[i] = rates[i - 1] + np.sign(delta) * MAX_ACCEL
-    src = np.empty_like(dst)
-    src[0] = 0.0
-    for i, rate in enumerate(rates):
-        src[i + 1] = src[i] + float(rate) * float(dst[i + 1] - dst[i])
-    for i in range(1, len(src)):
-        src[i] = max(float(src[i]), float(src[i - 1]) + 1e-3)
+        dlag = abs(float(lag_at[i] - lag_at[i - 1]))
+        if dlag >= 0.04:
+            continue
+        src[i] = max(float(src[i]), float(src[i - 1]) + 1e-4)
     keep = [i for i in range(len(src)) if i == 0 or src[i] <= in_sec + 1e-3]
     if len(keep) < 2:
         return np.array([0.0, min(in_sec, target_sec)]), np.array([0.0, min(in_sec, target_sec)])
@@ -457,6 +471,7 @@ def solve_time_map(
     weight = 0.0 if beat_weight is None else float(beat_weight)
     if weight <= 0 and beats is not None and len(np.asarray(beats)) >= 4:
         weight = BEAT_WEIGHT
+    rate_stats: dict = {}
     mapped = solve_constrained_lag_path(
         times,
         target,
@@ -473,6 +488,7 @@ def solve_time_map(
         high_margin_min=profile.high_margin,
         medium_conf=profile.medium_conf,
         medium_margin=profile.medium_margin,
+        rate_stats=rate_stats,
     )
     mapped = _monotonic_lag(times, mapped)
     jump_times = [j.time if hasattr(j, "time") else float(j["time"]) for j in report.jumps]
@@ -493,6 +509,11 @@ def solve_time_map(
     report.low_conf_spans = spans_where(times, labels, "low")
     report.markers = [float(v) for v in dst]
     report.profile = profile.name
+    report.rate_limit = {
+        "max_sec": round(float(rate_stats.get("max_sec", 0.0)), 6),
+        "rms_sec": round(float(rate_stats.get("rms_sec", 0.0)), 6),
+        "n_modified": int(rate_stats.get("n_modified", 0)),
+    }
     if beats is not None and len(beats):
         report.beats = [float(v) for v in np.asarray(beats, dtype=float) if 0 <= v <= target_sec + 1]
     if downbeats is not None and len(downbeats):

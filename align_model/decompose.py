@@ -47,6 +47,7 @@ class AlignmentReport:
     markers: list = field(default_factory=list)
     failures: list = field(default_factory=list)
     profile: str = "default"
+    rate_limit: dict = field(default_factory=dict)
     line_offset: float = 0.0
     line_slope: float = 0.0
     vocal: dict | None = None

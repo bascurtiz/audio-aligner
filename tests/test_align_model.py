@@ -7,6 +7,7 @@ import unittest
 import numpy as np
 
 from align_model.benchmark import (
+    case_continuous_vocal,
     case_drift,
     case_gaps,
     case_noise,
@@ -15,6 +16,7 @@ from align_model.benchmark import (
     case_perfect,
     case_repeated,
     case_sparse,
+    case_stripped_vocal,
     case_tempo_change,
     discontinuity_counts,
     measure_curve,
@@ -26,11 +28,19 @@ from align_model.params import resolve_profile
 from align_model.pipeline import map_from_points
 from align_model.quality import apply_codes, is_compensating, stamp_result
 from align_model.time_map import (
+    _clamp_accel,
     adaptive_marker_times,
     solve_constrained_lag_path,
     source_on_padded_wav,
     src_dst_from_lags,
 )
+
+
+def _one_speech_run(speech: list[tuple[float, float]]) -> bool:
+    """Speech spans that meet, with no restored rest between them."""
+    if not speech:
+        return False
+    return all(nxt[0] - prev[1] <= 0.05 for prev, nxt in zip(speech, speech[1:]))
 
 
 class DecomposeTests(unittest.TestCase):
@@ -255,21 +265,46 @@ class TimeMapTests(unittest.TestCase):
         file_trim = int(round(float(source_on_padded_wav(stored, -0.200)[0]) * sr))
         self.assertEqual(float(trimmed[file_trim]), 1.0)
 
-    def test_first_marker_starts_at_the_input(self) -> None:
-        """A negative opening source time is pinned to 0. The pad carries that offset."""
+    def test_marker_src_matches_residual_at_every_marker(self) -> None:
+        """padded source = dst - residual lag, including the first marker."""
         src, dst = src_dst_from_lags(
-            np.array([0.0, 2.0, 4.0, 6.0]),
-            np.array([0.08, 0.0, 0.0, 0.0]),
-            target_sec=6.0,
-            in_sec=6.0,
+            np.array([0.0, 5.0, 10.0]),
+            np.array([0.08, 0.08, 0.08]),
+            target_sec=10.0,
+            in_sec=10.0,
             min_spacing=2.0,
             max_spacing=30.0,
             curvature_gain=1.0,
         )
-        self.assertEqual(float(dst[0]), 0.0)
-        self.assertEqual(float(src[0]), 0.0)
-        self.assertAlmostEqual(float(dst[0] - 0.08), -0.08)
-        self.assertTrue(np.all(np.diff(src) >= -1e-3))
+        self.assertLess(float(np.max(np.abs(src - (dst - 0.08)))), 0.001)
+        curves = (
+            lambda t: (0.08, 0.9, 0.4),
+            lambda t: (0.01 * t, 0.9, 0.4),
+            lambda t: (0.04 * np.sin(2 * np.pi * t / 6.0), 0.9, 0.4),
+            lambda t: (0.08 if t >= 4.0 else 0.0, 0.9, 0.45),
+        )
+        for lag_at in curves:
+            stem = map_from_points(self._points(lag_at), target_sec=8.0, in_sec=8.0)
+            padded = source_on_padded_wav(stem.src, stem.pad_sec)
+            residual = np.interp(stem.dst, stem.times, stem.lags - stem.pad_sec)
+            err = float(np.max(np.abs(padded - (stem.dst - residual))))
+            self.assertLess(err, 0.001, lag_at(1.0))
+
+    def test_rate_limiter_records_how_far_it_moves_the_map(self) -> None:
+        times = np.arange(0.0, 8.0, 0.5)
+        straight = 0.01 * times
+        _limited, quiet = _clamp_accel(times, straight, 0.02)
+        self.assertEqual(quiet["n_modified"], 0)
+        self.assertLess(quiet["max_sec"], 1e-6)
+        corner = np.zeros_like(times)
+        corner[8:] = 0.03
+        _moved, loud = _clamp_accel(times, corner, 0.02)
+        self.assertGreater(loud["n_modified"], 0)
+        self.assertGreater(loud["max_sec"], 0.001)
+        self.assertGreater(loud["rms_sec"], 0.0)
+        stem = map_from_points(self._points(lambda t: (0.02 * t, 0.8, 0.3)), target_sec=8.0, in_sec=8.0)
+        recorded = stem.report["rate_limit"]
+        self.assertEqual(set(recorded), {"max_sec", "rms_sec", "n_modified"})
 
     def test_jumps_and_spikes_in_the_marker_map(self) -> None:
         def hold(step: float):
@@ -345,6 +380,39 @@ class GapTests(unittest.TestCase):
         self.assertLess(abs(peak_hz(early) - 196.0), 4.0)
         self.assertLess(abs(peak_hz(late) - 330.0), 4.0)
 
+    def test_continuous_vocal_is_one_global_map(self) -> None:
+        """Same timing stays on map_stem: one curve, no restored rest."""
+        row = case_continuous_vocal()
+        self.assertEqual(row["category"], "global")
+        self.assertEqual(row["n_phrases"], 0)
+        self.assertFalse(row["silence"])
+        self.assertTrue(row["monotonic"])
+        self.assertLess(row["errors"]["mae"], 0.05)
+        self.assertLess(row["max_abs_lag"], 0.05)
+
+    def test_stripped_vocal_does_not_inherit_the_short_gap(self) -> None:
+        """Phrase B keeps the reference rest. The short breath is not its timing."""
+        row = case_stripped_vocal()
+        self.assertEqual(row["category"], "gaps")
+        self.assertGreaterEqual(row["n_phrases"], 2, row["gap_notes"])
+        self.assertTrue(row["monotonic"])
+        self.assertLess(abs(row["phrase_dst"][0]), 0.30)
+        self.assertLess(abs(row["phrase_dst"][1] - row["b_reference"]), 0.40)
+        self.assertGreater(row["phrase_dst"][1] - row["b_if_chained"], 1.0)
+        self.assertTrue(any(dur >= 1.5 for dur in row["durations"]))
+        self.assertLess(row["stall_peak"], 1e-4)
+        self.assertGreater(row["stall_start"], 2.15)
+        self.assertGreater(row["speech_a_end"], 2.20)
+        self.assertGreater(row["speech_b_end"], 7.05)
+        self.assertLess(abs(row["pitch_a"] - 196.0), 6.0)
+        self.assertLess(abs(row["pitch_b"] - 330.0), 6.0)
+        self.assertLess(abs(row["pitch_a_tail"] - 196.0), 6.0)
+        self.assertLess(abs(row["pitch_b_tail"] - 330.0), 6.0)
+        self.assertLess(row["errors"]["mae"], 0.25)
+        self.assertIsNotNone(row["phrase_start_offset"])
+        self.assertIsNotNone(row["global_pad_sec"])
+        self.assertAlmostEqual(row["pad_sec"], float(row["phrase_start_offset"]), places=5)
+
 
 class QualityTests(unittest.TestCase):
     def test_codes_and_compensation(self) -> None:
@@ -413,7 +481,8 @@ class BenchmarkTests(unittest.TestCase):
 
         gaps = case_gaps()
         self.assertTrue(gaps["monotonic"])
-        self.assertTrue(any(0.7 <= dur <= 2.4 for dur in gaps["durations"]))
+        self.assertTrue(gaps["silence"])
+        self.assertTrue(_one_speech_run(gaps["speech"]))
 
         nonlinear = case_nonlinear()
         self.assertLess(nonlinear["errors"]["mae"], 0.08)
@@ -443,8 +512,25 @@ class BenchmarkTests(unittest.TestCase):
         for row in rows:
             self.assertTrue(row["monotonic"], row["name"])
             if row["name"] == "missing_internal_gaps":
-                self.assertTrue(any(0.7 <= dur <= 2.4 for dur in row["durations"]))
+                # No breath in the acapella, so this stays one speech run.
+                # The restored rest is stripped_vocal.
                 self.assertTrue(row["silence"])
+                self.assertTrue(_one_speech_run(row["speech"]))
+                continue
+            if row["name"] == "continuous_vocal":
+                self.assertEqual(row["n_phrases"], 0)
+                self.assertFalse(row["silence"])
+                self.assertLess(row["max_abs_lag"], 0.05)
+            if row["name"] == "stripped_vocal":
+                self.assertGreaterEqual(row["n_phrases"], 2, row.get("gap_notes"))
+                self.assertLess(abs(row["phrase_dst"][1] - row["b_reference"]), 0.40)
+                self.assertGreater(row["phrase_dst"][1] - row["b_if_chained"], 1.0)
+                self.assertLess(row["stall_peak"], 1e-4)
+                self.assertGreater(row["speech_a_end"], 2.20)
+                self.assertGreater(row["speech_b_end"], 7.05)
+                self.assertLess(row["errors"]["mae"], 0.25)
+                self.assertAlmostEqual(row["pad_sec"], float(row["phrase_start_offset"]), places=5)
+                self.assertIsNotNone(row["global_pad_sec"])
                 continue
             self.assertLess(row["errors"]["mae"], 0.25, row["name"])
         for name, truth in (
