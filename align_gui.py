@@ -59,6 +59,7 @@ from check_alignment import (
     review_fail_text,
 )
 from help_dialog import InfoIcon, show_align_help
+from lag_map_view import LagMapPanel
 from progress_modal import format_eta
 from warp_align_fail_all import DEFAULT_MAX_PAD_SEC, FAIL_ALL, find_backup_stems
 from window_chrome import (
@@ -388,6 +389,23 @@ def _warning_log(notes: str) -> list[str]:
     return lines
 
 
+def _model_log(row: dict) -> str:
+    report = row.get("alignment_report")
+    if not isinstance(report, dict) or not report:
+        return ""
+    offset_ms = float(report.get("offset_sec") or 0.0) * 1000.0
+    drift = float(report.get("drift_ms_per_min") or 0.0)
+    p95 = float(report.get("p95_error_sec") or 0.0) * 1000.0
+    jumps = int(report.get("n_discontinuities") or 0)
+    conf = float(report.get("confidence") or 0.0)
+    codes = [item.get("code", "") for item in report.get("failures") or [] if item.get("code")]
+    shown = ", ".join(codes[:4]) if codes else "none"
+    return (
+        f"Map           offset {offset_ms:+.0f} ms  drift {drift:+.0f} ms/min  "
+        f"p95 {p95:.0f} ms  jumps {jumps}  conf {conf:.2f}  {shown}"
+    )
+
+
 def format_song_log(row: dict) -> list[str]:
     """Short lines for one finished song. The stored notes stay unchanged."""
     notes = str(row.get("notes") or "")
@@ -408,7 +426,14 @@ def format_song_log(row: dict) -> list[str]:
         gap = "  " if detail else ""
         lines.append(f"  {label:<14}{verdict}{gap}{detail}".rstrip())
     lines.extend(f"  {part[0].upper()}{part[1:].replace(': ', ' ', 1)}" for part in fails)
-    for extra in (_loudness_log(notes), _repair_log(notes), _beat_log(notes), _phrase_log(notes), _pad_log(row)):
+    for extra in (
+        _loudness_log(notes),
+        _repair_log(notes),
+        _beat_log(notes),
+        _phrase_log(notes),
+        _pad_log(row),
+        _model_log(row),
+    ):
         if extra:
             lines.append(f"  {extra}")
     moved = str(row.get("moved_to") or "")
@@ -536,6 +561,7 @@ class AlignWorker(QThread):
                         use_demucs_vocals=True,
                         gaps_cut=bool(opts.get("gaps_cut", True)),
                         declick=opts.get("declick") or "rx",
+                        legacy_lag=bool(opts.get("legacy_lag", False)),
                         on_step=self._on_step,
                     )
                 else:
@@ -550,6 +576,7 @@ class AlignWorker(QThread):
                         dry_run=opts["dry_run"],
                         gaps_cut=bool(opts.get("gaps_cut", True)),
                         declick=opts.get("declick") or "rx",
+                        legacy_lag=bool(opts.get("legacy_lag", False)),
                         on_step=self._on_step,
                     )
 
@@ -815,6 +842,7 @@ class MainWindow(QWidget):
         self._progress_timer.timeout.connect(self._refresh_batch_progress)
 
         mid = QSplitter(Qt.Orientation.Horizontal)
+        results = QSplitter(Qt.Orientation.Vertical)
         self.table = QTableWidget(0, 10)
         self.table.setHorizontalHeaderLabels(
             [
@@ -898,9 +926,16 @@ class MainWindow(QWidget):
         self.table.setToolTip(
             "Results for each processed folder.\n"
             "Click a header to sort, or drag an edge to resize.\n"
-            "Right-click a row to re-align, play, or edit."
+            "Right-click a row to re-align, play, or edit.\n"
+            "The lag map under the table follows the selected row."
         )
-        mid.addWidget(self.table)
+        self.lag_panel = LagMapPanel()
+        self.table.itemSelectionChanged.connect(self._show_lag_map)
+        results.addWidget(self.table)
+        results.addWidget(self.lag_panel)
+        results.setStretchFactor(0, 3)
+        results.setStretchFactor(1, 2)
+        mid.addWidget(results)
 
         self.log_view = QTextEdit()
         self.log_view.setObjectName("LogView")
@@ -1146,6 +1181,12 @@ class MainWindow(QWidget):
         flags.addWidget(self.dry_run)
         flags.addWidget(self.move_on_pass)
         flags.addWidget(self.gaps_cut)
+        self.legacy_lag = QCheckBox("Previous lag path")
+        self.legacy_lag.setToolTip(
+            "Use the earlier chroma lag and rigid gap paste.\n"
+            "Off uses the alignment model: offset, drift, beats, and phrase gaps."
+        )
+        flags.addWidget(self.legacy_lag)
         flags.addStretch(1)
         form.addRow(flags)
 
@@ -1733,6 +1774,8 @@ class MainWindow(QWidget):
             self.move_on_pass.setChecked(data["move_on_pass"])
         if isinstance(data.get("gaps_cut"), bool):
             self.gaps_cut.setChecked(data["gaps_cut"])
+        if isinstance(data.get("legacy_lag"), bool):
+            self.legacy_lag.setChecked(data["legacy_lag"])
 
     def _load_comments(self) -> None:
         try:
@@ -1867,6 +1910,7 @@ class MainWindow(QWidget):
             "dry_run": self.dry_run.isChecked(),
             "move_on_pass": self.move_on_pass.isChecked(),
             "gaps_cut": self.gaps_cut.isChecked(),
+            "legacy_lag": self.legacy_lag.isChecked(),
             "max_pad_sec": self.max_pad.value(),
             "corr_min": self.corr_min.value(),
             "drift_ms": self.drift_ms.value(),
@@ -1903,6 +1947,7 @@ class MainWindow(QWidget):
         self.dry_run.toggled.connect(save)
         self.move_on_pass.toggled.connect(save)
         self.gaps_cut.toggled.connect(save)
+        self.legacy_lag.toggled.connect(save)
 
     def _schedule_settings_save(self, *_args: object) -> None:
         self._settings_timer.start()
@@ -1921,6 +1966,23 @@ class MainWindow(QWidget):
             self._save_results()
         super().closeEvent(event)
 
+    def _show_lag_map(self) -> None:
+        selected = self.table.selectionModel().selectedRows()
+        if not selected:
+            self.lag_panel.clear()
+            return
+        item = self.table.item(selected[0].row(), COL_FOLDER)
+        raw = item.data(ROW_ROLE) if item is not None else None
+        report = None
+        if isinstance(raw, str) and raw:
+            try:
+                payload = json.loads(raw)
+            except json.JSONDecodeError:
+                payload = {}
+            if isinstance(payload, dict):
+                report = payload.get("alignment_report")
+        self.lag_panel.set_report(report if isinstance(report, dict) else None)
+
     def _opts(self) -> dict:
         limit = self.limit_spin.value()
         return {
@@ -1933,6 +1995,7 @@ class MainWindow(QWidget):
             "dry_run": self.dry_run.isChecked(),
             "move_on_pass": self.move_on_pass.isChecked(),
             "gaps_cut": self.gaps_cut.isChecked(),
+            "legacy_lag": self.legacy_lag.isChecked(),
             "max_pad_sec": float(self.max_pad.value()),
             "corr_min": float(self.corr_min.value()),
             "drift_ms": float(self.drift_ms.value()),

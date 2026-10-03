@@ -85,6 +85,7 @@ class WarpResult:
     inst_lag_sec: float = 0.0
     aca_checkpoints: list | None = None
     inst_checkpoints: list | None = None
+    alignment_report: dict | None = None
 
 
 def peak_norm(y: np.ndarray) -> np.ndarray:
@@ -602,6 +603,7 @@ def _build_timemap(
     in_frames: int,
     out_frames: int,
     grid_sec: np.ndarray | None = None,
+    src_dst: tuple[np.ndarray, np.ndarray] | None = None,
 ) -> list[tuple[int, int]]:
     """Map padded-input frames -> output frames using lag(t) on the output timeline.
 
@@ -611,7 +613,9 @@ def _build_timemap(
     """
     t_end = out_frames / sr
     in_sec = max(0.0, (in_frames - 1) / sr) if sr else 0.0
-    if grid_sec is not None or lag_line_rms(times, lags) > 0.02:
+    if src_dst is not None:
+        src_s, dst_s = src_dst
+    elif grid_sec is not None or lag_line_rms(times, lags) > 0.02:
         src_s, dst_s = follow_lag_src_dst(
             times, lags, target_sec=t_end, in_sec=in_sec, grid_sec=grid_sec
         )
@@ -657,6 +661,7 @@ def rubberband_timemap_stretch(
     lags: np.ndarray,
     target_frames: int,
     grid_sec: np.ndarray | None = None,
+    src_dst: tuple[np.ndarray, np.ndarray] | None = None,
 ) -> np.ndarray:
     """Pitch-preserving warp via Rubber Band timemap. y may be multi-channel (N, C)."""
     exe = _ensure_rubberband_on_path()
@@ -681,6 +686,7 @@ def rubberband_timemap_stretch(
             in_frames=len(y_out),
             out_frames=target_frames,
             grid_sec=grid_sec,
+            src_dst=src_dst,
         )
         mapfile.write_text(
             "\n".join(f"{src} {tgt}" for src, tgt in pairs) + "\n", encoding="utf-8"
@@ -744,6 +750,7 @@ def write_warped_stem(
     target_frames: int,
     target_channels: int,
     grid_sec: np.ndarray | None = None,
+    src_dst: tuple[np.ndarray, np.ndarray] | None = None,
 ) -> None:
     """Pad/trim then Rubber Band timemap-warp to original length (pitch preserved)."""
     y, file_sr = sf.read(str(src), always_2d=True, dtype="float32")
@@ -759,7 +766,7 @@ def write_warped_stem(
     elif n < 0:
         y = y[min(-n, len(y)) :]
 
-    if len(times) >= 2 and len(lags) >= 2:
+    if src_dst is not None or (len(times) >= 2 and len(lags) >= 2):
         y = rubberband_timemap_stretch(
             y,
             sr=target_sr,
@@ -767,6 +774,7 @@ def write_warped_stem(
             lags=lags,
             target_frames=target_frames,
             grid_sec=grid_sec,
+            src_dst=src_dst,
         )
     else:
         y = fit_len_2d(y, target_frames)
@@ -852,6 +860,223 @@ def _emit_step(on_step, step_id: str) -> None:
         pass
 
 
+def _align_folder_model(
+    result: WarpResult,
+    *,
+    folder: Path,
+    max_pad_sec: float,
+    corr_min: float,
+    drift_ms: float,
+    window_corr_min: float,
+    weak_window_frac: float,
+    move_on_pass: bool,
+    dry_run: bool,
+    gaps_cut: bool,
+    declick: str,
+    on_step,
+    aca_src: Path,
+    inst_src: Path,
+    orig: Path,
+) -> None:
+    """Same map as the REAPER path. Phrase stretch and the instrumental use Rubber Band."""
+    from align_model.beats import load_beats
+    from align_model.gaps import write_gap_file
+    from align_model.params import resolve_profile
+    from align_model.pipeline import combine_reports, map_stem, map_vocal_gaps
+    from align_model.quality import notes_fragment, stamp_result
+
+    _ensure_rubberband_on_path()
+    orig_m = peak_norm(load_mono(orig, SR_ANALYSIS))
+    aca_m = peak_norm(load_mono(aca_src, SR_ANALYSIS))
+    inst_m = peak_norm(load_mono(inst_src, SR_ANALYSIS))
+    orig_vox = peak_norm(bandpass(orig_m, SR_ANALYSIS))
+    aca_vox = peak_norm(bandpass(aca_m, SR_ANALYSIS))
+    profile = resolve_profile(
+        orig_m,
+        SR_ANALYSIS,
+        max_pad_sec=max_pad_sec,
+        corr_min=corr_min,
+        drift_ms=drift_ms,
+    )
+    max_pad_sec = profile.max_pad_sec
+    corr_min = profile.corr_min
+    drift_ms = profile.drift_ms
+    aca_pad, aca_score = chroma_xcorr_pad(
+        orig_vox, aca_vox, sr=SR_ANALYSIS, max_pad_sec=max_pad_sec
+    )
+    from demucs_vocals import load_instrumental_mono, load_vocals_mono
+
+    _emit_step(on_step, "demucs")
+    inst_ref = peak_norm(load_instrumental_mono(orig, SR_ANALYSIS, folder=folder))
+    vocal_ref = peak_norm(bandpass(load_vocals_mono(orig, SR_ANALYSIS, folder=folder), SR_ANALYSIS))
+    inst_pad, inst_score = chroma_xcorr_pad(
+        inst_ref, inst_m, sr=SR_ANALYSIS, max_pad_sec=max_pad_sec
+    )
+    inst_p = fit_len(pad_or_trim_front(inst_m, inst_pad, SR_ANALYSIS), len(inst_ref))
+    beats, downbeats = load_beats(orig)
+    inst_map = map_stem(
+        inst_ref,
+        peak_norm(inst_p),
+        SR_ANALYSIS,
+        kind="instrumental",
+        profile=profile,
+        beats=beats,
+        downbeats=downbeats,
+        target_sec=len(inst_ref) / SR_ANALYSIS,
+        in_sec=len(inst_p) / SR_ANALYSIS,
+    )
+    inst_pad = float(inst_pad + inst_map.pad_sec)
+    if gaps_cut:
+        _emit_step(on_step, "silence")
+        aca_map = map_vocal_gaps(
+            aca_m,
+            vocal_ref,
+            SR_ANALYSIS,
+            profile=profile,
+            target_sec=len(vocal_ref) / SR_ANALYSIS,
+            beats=beats,
+            downbeats=downbeats,
+        )
+        result.aca_pad_sec = float(aca_map.pad_sec)
+    else:
+        aca_p = fit_len(pad_or_trim_front(aca_m, aca_pad, SR_ANALYSIS), len(orig_m))
+        aca_pv = peak_norm(bandpass(peak_norm(aca_p), SR_ANALYSIS))
+        aca_map = map_stem(
+            orig_vox,
+            aca_pv,
+            SR_ANALYSIS,
+            kind="vocal",
+            profile=profile,
+            beats=beats,
+            downbeats=downbeats,
+            target_sec=len(orig_vox) / SR_ANALYSIS,
+            in_sec=len(aca_pv) / SR_ANALYSIS,
+        )
+        result.aca_pad_sec = float(aca_pad + aca_map.pad_sec)
+    result.inst_pad_sec = inst_pad
+    if len(aca_map.lags):
+        result.aca_drift_range_ms = float((float(np.max(aca_map.lags)) - float(np.min(aca_map.lags))) * 1000)
+    if len(inst_map.lags):
+        result.inst_drift_range_ms = float((float(np.max(inst_map.lags)) - float(np.min(inst_map.lags))) * 1000)
+    report = combine_reports(aca_map.report, inst_map.report, profile=profile.name)
+    if len(beats):
+        report["beats"] = [round(float(v), 3) for v in beats if v >= 0]
+        report["downbeats"] = [round(float(v), 3) for v in downbeats if v >= 0]
+    result.alignment_report = report
+    result.notes = (
+        f"engine=rubberband-model{'+aca_gaps' if gaps_cut else ''}; "
+        f"aca_score={aca_score:.3f}; inst_score={inst_score:.3f}; "
+        f"{notes_fragment(report)}; inst_elastique_ref=demucs_instrumental"
+    )
+    result.notes += "; aca_gaps=1" if gaps_cut else "; aca_gaps=0"
+    declick_plan = resolve_declick(declick, host_rx=False)
+    result.notes += f"; {declick_plan.note}; inst_declick=off"
+    if dry_run:
+        result.verdict = "dry_run"
+        return
+
+    info = sf.info(str(orig))
+    _emit_step(on_step, "align")
+    bar_grid, bar_note = bar_grid_for(orig, info.frames / info.samplerate)
+    result.notes += f"; {bar_note}"
+    aca_dest = folder / aca_src.name
+    if gaps_cut and aca_map.spans:
+        gap_notes = write_gap_file(
+            aca_src,
+            aca_dest,
+            aca_map.spans,
+            target_sr=info.samplerate,
+            target_frames=info.frames,
+            target_channels=info.channels,
+            engine="rubberband",
+        )
+        if gap_notes:
+            result.notes += "; " + "; ".join(gap_notes)
+    else:
+        write_warped_stem(
+            aca_src,
+            aca_dest,
+            pad_sec=float(result.aca_pad_sec or 0.0),
+            times=aca_map.times,
+            lags=aca_map.lags,
+            target_sr=info.samplerate,
+            target_frames=info.frames,
+            target_channels=info.channels,
+            grid_sec=bar_grid,
+            src_dst=(aca_map.src, aca_map.dst),
+        )
+    write_warped_stem(
+        inst_src,
+        folder / inst_src.name,
+        pad_sec=inst_pad,
+        times=inst_map.times,
+        lags=inst_map.lags,
+        target_sr=info.samplerate,
+        target_frames=info.frames,
+        target_channels=info.channels,
+        grid_sec=bar_grid,
+        src_dst=(inst_map.src, inst_map.dst),
+    )
+    _emit_step(on_step, "loudness")
+    try:
+        from demucs_vocals import match_aligned_stems_to_demucs_isolated
+
+        loud = match_aligned_stems_to_demucs_isolated(
+            orig,
+            aca_dest,
+            folder / inst_src.name,
+            folder=folder,
+        )
+        result.notes += (
+            f"; loudness_match aca={loud['aca_gain_db']:+.1f}dB inst={loud['inst_gain_db']:+.1f}dB"
+        )
+    except Exception as exc:  # noqa: BLE001
+        result.notes += f"; loudness_match_skip:{type(exc).__name__}:{exc}"
+
+    _emit_step(on_step, "score")
+    aca, inst, orig2, scan_notes = scan_folder(folder)
+    if not aca or not inst or not orig2:
+        result.verdict = "error"
+        result.notes += f"; post_scan:{scan_notes}"
+        return
+    mix_verdict, corr, lag, drift, _weak, notes = analyze_alignment(
+        aca,
+        inst,
+        orig2,
+        corr_min=corr_min,
+        drift_ms=drift_ms,
+        window_corr_min=window_corr_min,
+        weak_window_frac=weak_window_frac,
+    )
+    result.corr = corr
+    result.lag_sec = lag
+    result.drift_ms = drift
+    result.notes += f"; {notes}"
+    apply_stem_check(
+        result,
+        aca,
+        inst,
+        orig2,
+        folder=folder,
+        corr_min=corr_min,
+        drift_ms=drift_ms,
+        window_corr_min=window_corr_min,
+        weak_window_frac=weak_window_frac,
+    )
+    stamp_result(result, mix_verdict=mix_verdict, mix_corr=corr, mix_lag=lag, mix_drift=drift)
+    if move_on_pass and result.verdict in ("pass", "fail"):
+        _emit_step(on_step, "tag")
+        try:
+            dest = tag_folder_verdict(folder, result.verdict)
+        except FileExistsError:
+            result.notes += "; dest_exists"
+        except OSError as exc:
+            result.notes += f"; rename_failed:{exc}"
+        else:
+            if dest is not None:
+                result.moved_to = str(dest)
+
+
 def warp_align_folder(
     folder: Path,
     *,
@@ -865,6 +1090,7 @@ def warp_align_folder(
     gaps_cut: bool = True,
     declick: str = "rx",
     on_step=None,
+    legacy_lag: bool = False,
 ) -> WarpResult:
     result = WarpResult(folder=folder.name)
     aca_src, inst_src, orig = find_backup_stems(folder)
@@ -881,6 +1107,25 @@ def warp_align_folder(
         return result
 
     try:
+        if not legacy_lag:
+            _align_folder_model(
+                result,
+                folder=folder,
+                max_pad_sec=max_pad_sec,
+                corr_min=corr_min,
+                drift_ms=drift_ms,
+                window_corr_min=window_corr_min,
+                weak_window_frac=weak_window_frac,
+                move_on_pass=move_on_pass,
+                dry_run=dry_run,
+                gaps_cut=gaps_cut,
+                declick=declick,
+                on_step=on_step,
+                aca_src=aca_src,
+                inst_src=inst_src,
+                orig=orig,
+            )
+            return result
         _ensure_rubberband_on_path()
         orig_m = peak_norm(load_mono(orig, SR_ANALYSIS))
         aca_m = peak_norm(load_mono(aca_src, SR_ANALYSIS))
@@ -1062,6 +1307,8 @@ def _worker(payload: dict) -> dict:
             move_on_pass=payload["move_on_pass"],
             dry_run=payload["dry_run"],
             declick=payload.get("declick", "rx"),
+            gaps_cut=payload.get("gaps_cut", True),
+            legacy_lag=payload.get("legacy_lag", False),
         )
     )
 
@@ -1083,8 +1330,8 @@ def write_csv(path: Path, rows: list[dict]) -> None:
         for row in rows:
             cells = {}
             for key, value in row.items():
-                if isinstance(value, (list, tuple)):
-                    cells[key] = json.dumps(list(value), ensure_ascii=False)
+                if isinstance(value, (list, tuple, dict)):
+                    cells[key] = json.dumps(value, ensure_ascii=False)
                 else:
                     cells[key] = value
             w.writerow(cells)
@@ -1111,6 +1358,11 @@ def main() -> int:
         "both leave the acapella untouched. The instrumental is not de-clicked.",
     )
     ap.add_argument("--csv", type=Path, default=OUT_DIR / "fail_all_warp_align.csv")
+    ap.add_argument(
+        "--legacy-lag",
+        action="store_true",
+        help="Use the previous chroma lag path instead of the alignment model.",
+    )
     ap.add_argument(
         "--skip-existing-pass",
         action="store_true",
@@ -1149,6 +1401,7 @@ def main() -> int:
             "move_on_pass": not args.no_move and not args.dry_run,
             "dry_run": args.dry_run,
             "declick": args.declick,
+            "legacy_lag": args.legacy_lag,
         }
         for f in folders
     ]

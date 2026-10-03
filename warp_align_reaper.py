@@ -564,6 +564,7 @@ def stage_stem_reaper(
     despike: bool = True,
     stretch_mode: str | None = None,
     grid_sec: np.ndarray | None = None,
+    src_dst: tuple[np.ndarray, np.ndarray] | None = None,
 ) -> _StagedStem:
     """Write the padded wav and the stretch job. Does not start REAPER."""
     target_sec = target_frames / target_sr
@@ -572,16 +573,20 @@ def stage_stem_reaper(
     padded = tmp_path / "padded.wav"
     rendered = tmp_path / "rendered.wav"
     in_sec = write_padded_wav(src, padded, pad_sec=pad_sec, target_sr=target_sr)
-    markers = markers_from_lag(
-        times,
-        lags,
-        target_sec=target_sec,
-        in_sec=in_sec,
-        follow=follow_lag,
-        scores=scores,
-        despike=despike,
-        grid_sec=grid_sec,
-    )
+    if src_dst is not None:
+        src_s, dst_s = src_dst
+        markers = [{"src": float(s), "dst": float(d)} for s, d in zip(src_s, dst_s)]
+    else:
+        markers = markers_from_lag(
+            times,
+            lags,
+            target_sec=target_sec,
+            in_sec=in_sec,
+            follow=follow_lag,
+            scores=scores,
+            despike=despike,
+            grid_sec=grid_sec,
+        )
     # The last marker is not the end. Hold its rate until the source tail
     # has played, and keep the original's length when the source is shorter.
     render_sec = playback_end_sec(markers, in_sec=in_sec, target_sec=target_sec)
@@ -700,6 +705,7 @@ def warp_stem_reaper(
     scores: np.ndarray | None = None,
     grid_sec: np.ndarray | None = None,
     stretch_mode: str | None = None,
+    src_dst: tuple[np.ndarray, np.ndarray] | None = None,
 ) -> None:
     staged = stage_stem_reaper(
         src,
@@ -714,6 +720,7 @@ def warp_stem_reaper(
         scores=scores,
         grid_sec=grid_sec,
         stretch_mode=stretch_mode,
+        src_dst=src_dst,
     )
     warp_stems_reaper(reaper_exe, [staged])
 
@@ -750,9 +757,22 @@ def reprocess_edited_acapella(
         bandpass(load_vocals_mono(orig, SR_ANALYSIS, folder=folder), SR_ANALYSIS)
     )
     n = min(len(elastique_ref), len(aca_v))
-    t_ae, lag_ae, sc_ae = lag_curve(elastique_ref[:n], aca_v[:n], sr=SR_ANALYSIS)
-    t_ae, lag_ae = smooth_lags(t_ae, lag_ae, sc_ae)
-    lag_ae, aca_bias = absorb_lag_offset(t_ae, lag_ae, sc_ae)
+    from align_model.params import resolve_profile
+    from align_model.pipeline import map_stem
+
+    profile = resolve_profile(elastique_ref, SR_ANALYSIS)
+    aca_map = map_stem(
+        elastique_ref[:n],
+        aca_v[:n],
+        SR_ANALYSIS,
+        kind="vocal",
+        profile=profile,
+        target_sec=n / SR_ANALYSIS,
+        in_sec=n / SR_ANALYSIS,
+    )
+    t_ae, lag_ae, sc_ae = aca_map.times, aca_map.lags, aca_map.scores
+    aca_bias = float(aca_map.pad_sec)
+    aca_src_dst = (aca_map.src, aca_map.dst)
 
     declick_plan = resolve_declick(declick, host_rx=True)
     notes = [
@@ -783,6 +803,7 @@ def reprocess_edited_acapella(
         follow_lag=True,
         scores=sc_ae,
         grid_sec=bar_grid,
+        src_dst=aca_src_dst,
     )
 
     try:
@@ -844,15 +865,22 @@ def reprocess_edited_instrumental(
     inst_m = peak_norm(load_mono(inst_dest, SR_ANALYSIS))
     inst_ref = peak_norm(load_instrumental_mono(orig, SR_ANALYSIS, folder=folder))
     n = min(len(inst_ref), len(inst_m))
-    t_i, lag_i, sc_i = lag_curve(inst_ref[:n], inst_m[:n], sr=SR_ANALYSIS)
-    t_i, lag_i = smooth_lags(t_i, lag_i, sc_i)
-    lag_i, inst_bias = absorb_lag_offset(t_i, lag_i, sc_i)
-    inst_for_onset = fit_len(pad_or_trim_front(inst_m, inst_bias, SR_ANALYSIS), len(inst_ref))
-    t_o, lag_o, sc_o = onset_lag_curve(inst_ref, peak_norm(inst_for_onset), sr=SR_ANALYSIS)
-    if len(lag_o) >= 2:
-        lag_o, onset_bias = absorb_lag_offset(t_o, lag_o, sc_o)
-        inst_bias += onset_bias
-        t_i, lag_i, sc_i = t_o, lag_o, sc_o
+    from align_model.params import resolve_profile
+    from align_model.pipeline import map_stem
+
+    profile = resolve_profile(inst_ref, SR_ANALYSIS)
+    inst_map = map_stem(
+        inst_ref[:n],
+        inst_m[:n],
+        SR_ANALYSIS,
+        kind="instrumental",
+        profile=profile,
+        target_sec=n / SR_ANALYSIS,
+        in_sec=n / SR_ANALYSIS,
+    )
+    t_i, lag_i, sc_i = inst_map.times, inst_map.lags, inst_map.scores
+    inst_bias = float(inst_map.pad_sec)
+    inst_src_dst = (inst_map.src, inst_map.dst)
 
     notes = [
         "section_edit=inst",
@@ -883,6 +911,7 @@ def reprocess_edited_instrumental(
         scores=sc_i,
         grid_sec=bar_grid,
         stretch_mode="transient",
+        src_dst=inst_src_dst,
     )
 
     try:
@@ -1086,6 +1115,272 @@ def _repair_rendered_stems(
     return "; ".join(notes)
 
 
+def _process_folder_model(
+    result: WarpResult,
+    *,
+    folder: Path,
+    reaper_exe: Path,
+    max_pad_sec: float,
+    corr_min: float,
+    drift_ms: float,
+    window_corr_min: float,
+    weak_window_frac: float,
+    move_on_pass: bool,
+    dry_run: bool,
+    use_demucs_vocals: bool,
+    gaps_cut: bool,
+    declick: str,
+    on_step,
+    aca_src: Path,
+    inst_src: Path,
+    orig: Path,
+) -> None:
+    """Evidence, robust time map, gap-aware vocal render, then the usual checks."""
+    from align_model.beats import load_beats
+    from align_model.gaps import write_gap_file
+    from align_model.params import resolve_profile
+    from align_model.pipeline import combine_reports, map_stem, map_vocal_gaps
+    from align_model.quality import notes_fragment, stamp_result
+
+    orig_m = peak_norm(load_mono(orig, SR_ANALYSIS))
+    aca_m = peak_norm(load_mono(aca_src, SR_ANALYSIS))
+    inst_m = peak_norm(load_mono(inst_src, SR_ANALYSIS))
+    orig_vox = peak_norm(bandpass(orig_m, SR_ANALYSIS))
+    aca_vox = peak_norm(bandpass(aca_m, SR_ANALYSIS))
+    profile = resolve_profile(
+        orig_m,
+        SR_ANALYSIS,
+        max_pad_sec=max_pad_sec,
+        corr_min=corr_min,
+        drift_ms=drift_ms,
+    )
+    max_pad_sec = profile.max_pad_sec
+    corr_min = profile.corr_min
+    drift_ms = profile.drift_ms
+    aca_pad, aca_score = chroma_xcorr_pad(
+        orig_vox, aca_vox, sr=SR_ANALYSIS, max_pad_sec=max_pad_sec
+    )
+    if use_demucs_vocals:
+        from demucs_vocals import load_instrumental_mono, load_vocals_mono
+
+        _emit_step(on_step, "demucs")
+        inst_ref = peak_norm(load_instrumental_mono(orig, SR_ANALYSIS, folder=folder))
+        vocal_ref = peak_norm(bandpass(load_vocals_mono(orig, SR_ANALYSIS, folder=folder), SR_ANALYSIS))
+        inst_ref_note = "demucs_instrumental"
+        vocal_ref_note = "demucs_vocals"
+    else:
+        inst_ref = orig_m
+        vocal_ref = orig_vox
+        inst_ref_note = "mix"
+        vocal_ref_note = "mix"
+    inst_pad, inst_score = chroma_xcorr_pad(
+        inst_ref, inst_m, sr=SR_ANALYSIS, max_pad_sec=max_pad_sec
+    )
+    inst_p = fit_len(pad_or_trim_front(inst_m, inst_pad, SR_ANALYSIS), len(inst_ref))
+    beats, downbeats = load_beats(orig)
+    inst_map = map_stem(
+        inst_ref,
+        peak_norm(inst_p),
+        SR_ANALYSIS,
+        kind="instrumental",
+        profile=profile,
+        beats=beats,
+        downbeats=downbeats,
+        target_sec=len(inst_ref) / SR_ANALYSIS,
+        in_sec=len(inst_p) / SR_ANALYSIS,
+    )
+    inst_pad = float(inst_pad + inst_map.pad_sec)
+    if gaps_cut:
+        _emit_step(on_step, "silence")
+        aca_map = map_vocal_gaps(
+            aca_m,
+            vocal_ref,
+            SR_ANALYSIS,
+            profile=profile,
+            target_sec=len(vocal_ref) / SR_ANALYSIS,
+            beats=beats,
+            downbeats=downbeats,
+        )
+        result.aca_pad_sec = float(aca_map.pad_sec)
+    else:
+        aca_p = fit_len(pad_or_trim_front(aca_m, aca_pad, SR_ANALYSIS), len(orig_m))
+        aca_pv = peak_norm(bandpass(peak_norm(aca_p), SR_ANALYSIS))
+        aca_map = map_stem(
+            orig_vox,
+            aca_pv,
+            SR_ANALYSIS,
+            kind="vocal",
+            profile=profile,
+            beats=beats,
+            downbeats=downbeats,
+            target_sec=len(orig_vox) / SR_ANALYSIS,
+            in_sec=len(aca_pv) / SR_ANALYSIS,
+        )
+        result.aca_pad_sec = float(aca_pad + aca_map.pad_sec)
+    result.inst_pad_sec = inst_pad
+    if len(aca_map.lags):
+        result.aca_drift_range_ms = float((float(np.max(aca_map.lags)) - float(np.min(aca_map.lags))) * 1000)
+    if len(inst_map.lags):
+        result.inst_drift_range_ms = float((float(np.max(inst_map.lags)) - float(np.min(inst_map.lags))) * 1000)
+    report = combine_reports(aca_map.report, inst_map.report, profile=profile.name)
+    if len(beats):
+        report["beats"] = [round(float(v), 3) for v in beats if v >= 0]
+        report["downbeats"] = [round(float(v), 3) for v in downbeats if v >= 0]
+    result.alignment_report = report
+    gap_tag = "+aca_gaps" if gaps_cut else ""
+    result.notes = (
+        f"engine=reaper-model{gap_tag}; "
+        f"aca_score={aca_score:.3f}; inst_score={inst_score:.3f}; "
+        f"{notes_fragment(report)}"
+    )
+    result.notes += "; aca_gaps=1" if gaps_cut else "; aca_gaps=0"
+    result.notes += f"; inst_elastique_ref={inst_ref_note}; aca_ref={vocal_ref_note}"
+    inserts = report.get("gap_inserts") or []
+    if inserts:
+        shown = ",".join(f"{float(span[1]) - float(span[0]):.3f}" for span in inserts[:6])
+        result.notes += f"; aca_gap_inserts={shown}"
+    declick_plan = resolve_declick(declick, host_rx=True)
+    result.notes += f"; {declick_plan.note}; inst_declick=off"
+    if dry_run:
+        result.verdict = "dry_run"
+        return
+
+    info = sf.info(str(orig))
+    aca_dest = folder / aca_src.name
+    inst_dest = folder / inst_src.name
+    _emit_step(on_step, "align")
+    bar_grid, bar_note = marker_bar_grid(orig, info.frames / info.samplerate)
+    result.notes += f"; {bar_note}; inst_stretch=transient"
+    staged: list[_StagedStem] = []
+    try:
+        if gaps_cut and aca_map.spans:
+            gap_notes = write_gap_file(
+                aca_src,
+                aca_dest,
+                aca_map.spans,
+                target_sr=info.samplerate,
+                target_frames=info.frames,
+                target_channels=info.channels,
+                engine="reaper",
+                reaper_exe=reaper_exe,
+            )
+            if gap_notes:
+                result.notes += "; " + "; ".join(gap_notes)
+        else:
+            staged.append(
+                stage_stem_reaper(
+                    aca_src,
+                    aca_dest,
+                    pad_sec=float(result.aca_pad_sec or 0.0),
+                    times=aca_map.times,
+                    lags=aca_map.lags,
+                    target_sr=info.samplerate,
+                    target_frames=info.frames,
+                    follow_lag=True,
+                    scores=aca_map.scores,
+                    grid_sec=bar_grid,
+                    src_dst=(aca_map.src, aca_map.dst),
+                )
+            )
+        staged.append(
+            stage_stem_reaper(
+                inst_src,
+                inst_dest,
+                pad_sec=inst_pad,
+                times=inst_map.times,
+                lags=inst_map.lags,
+                target_sr=info.samplerate,
+                target_frames=info.frames,
+                follow_lag=True,
+                scores=inst_map.scores,
+                stretch_mode="transient",
+                grid_sec=bar_grid,
+                src_dst=(inst_map.src, inst_map.dst),
+            )
+        )
+        warp_stems_reaper(reaper_exe, staged)
+    finally:
+        for item in staged:
+            item.tmp.cleanup()
+
+    try:
+        from demucs_vocals import load_instrumental_mono, load_vocals_mono
+
+        repair_note = _repair_rendered_stems(
+            [
+                ("aca", aca_dest, load_vocals_mono(orig, SR_ANALYSIS, folder=folder)),
+                ("inst", inst_dest, load_instrumental_mono(orig, SR_ANALYSIS, folder=folder)),
+            ],
+            reaper_exe=reaper_exe,
+            target_sr=info.samplerate,
+            target_frames=info.frames,
+            drift_ms=drift_ms,
+            on_step=on_step,
+            grid_sec=bar_grid,
+            declick_aca=False,
+        )
+        if repair_note:
+            result.notes += f"; {repair_note}"
+    except Exception as exc:  # noqa: BLE001 — the first warp still stands
+        result.notes += f"; repair_skip:{type(exc).__name__}:{exc}"
+
+    time.sleep(0.35)
+    _emit_step(on_step, "loudness")
+    try:
+        from demucs_vocals import match_aligned_stems_to_demucs_isolated
+
+        loud = match_aligned_stems_to_demucs_isolated(orig, aca_dest, inst_dest, folder=folder)
+        result.notes += (
+            f"; loudness_match aca={loud['aca_gain_db']:+.1f}dB inst={loud['inst_gain_db']:+.1f}dB"
+        )
+    except Exception as exc:  # noqa: BLE001
+        result.notes += f"; loudness_match_skip:{type(exc).__name__}:{exc}"
+
+    _apply_aca_declick(aca_dest, declick_plan.method, reaper_exe)
+    _emit_step(on_step, "score")
+    aca, inst, orig2, scan_notes = scan_folder(folder)
+    if not aca or not inst or not orig2:
+        result.verdict = "error"
+        result.notes += f"; post_scan:{scan_notes}"
+        return
+    mix_verdict, corr, lag, drift, _weak, notes = analyze_alignment(
+        aca,
+        inst,
+        orig2,
+        corr_min=corr_min,
+        drift_ms=drift_ms,
+        window_corr_min=window_corr_min,
+        weak_window_frac=weak_window_frac,
+    )
+    result.corr = corr
+    result.lag_sec = lag
+    result.drift_ms = drift
+    result.notes += f"; {notes}"
+    apply_stem_check(
+        result,
+        aca,
+        inst,
+        orig2,
+        folder=folder,
+        corr_min=corr_min,
+        drift_ms=drift_ms,
+        window_corr_min=window_corr_min,
+        weak_window_frac=weak_window_frac,
+    )
+    stamp_result(result, mix_verdict=mix_verdict, mix_corr=corr, mix_lag=lag, mix_drift=drift)
+    if move_on_pass and result.verdict in ("pass", "fail"):
+        _emit_step(on_step, "tag")
+        try:
+            dest = tag_folder_verdict(folder, result.verdict)
+        except FileExistsError:
+            result.notes += "; dest_exists"
+        except OSError as exc:
+            result.notes += f"; rename_failed:{exc}"
+        else:
+            if dest is not None:
+                result.moved_to = str(dest)
+
+
 def process_folder(
     folder: Path,
     *,
@@ -1101,6 +1396,7 @@ def process_folder(
     gaps_cut: bool = True,
     declick: str = "rx",
     on_step=None,
+    legacy_lag: bool = False,
 ) -> WarpResult:
     result = WarpResult(folder=folder.name)
     aca_src, inst_src, orig = find_backup_stems(folder)
@@ -1117,6 +1413,28 @@ def process_folder(
         return result
 
     try:
+        if not legacy_lag:
+            _process_folder_model(
+                result,
+                folder=folder,
+                reaper_exe=reaper_exe,
+                max_pad_sec=max_pad_sec,
+                corr_min=corr_min,
+                drift_ms=drift_ms,
+                window_corr_min=window_corr_min,
+                weak_window_frac=weak_window_frac,
+                move_on_pass=move_on_pass,
+                dry_run=dry_run,
+                use_demucs_vocals=use_demucs_vocals,
+                gaps_cut=gaps_cut,
+                declick=declick,
+                on_step=on_step,
+                aca_src=aca_src,
+                inst_src=inst_src,
+                orig=orig,
+            )
+            return result
+
         orig_m = peak_norm(load_mono(orig, SR_ANALYSIS))
         aca_m = peak_norm(load_mono(aca_src, SR_ANALYSIS))
         inst_m = peak_norm(load_mono(inst_src, SR_ANALYSIS))
@@ -1430,6 +1748,11 @@ def main() -> int:
         "--no-gaps-cut keeps those rests and locks the vocal to the instrumental.",
     )
     ap.add_argument("--csv", type=Path, default=OUT_DIR / "fail_all_reaper_elastique.csv")
+    ap.add_argument(
+        "--legacy-lag",
+        action="store_true",
+        help="Use the previous chroma lag path instead of the alignment model.",
+    )
     args = ap.parse_args()
 
     reaper_exe = find_reaper(args.reaper_exe)
@@ -1468,6 +1791,7 @@ def main() -> int:
             use_demucs_vocals=args.use_demucs_vocals,
             gaps_cut=args.gaps_cut,
             declick=args.declick,
+            legacy_lag=args.legacy_lag,
         )
         rows.append(asdict(r))
         moved = f" -> {Path(r.moved_to).name}" if r.moved_to else ""

@@ -96,6 +96,7 @@ class CheckResult:
     # [time_sec, lag_ms, search_edge]. None means this result never measured them.
     aca_checkpoints: list | None = None
     inst_checkpoints: list | None = None
+    alignment_report: dict | None = None
 
 
 def _peak_norm(y: np.ndarray) -> np.ndarray:
@@ -1150,6 +1151,9 @@ def process_folder(
         window_corr_min=window_corr_min,
         weak_window_frac=weak_window_frac,
     )
+    from align_model.quality import stamp_result
+
+    stamp_result(result, mix_verdict=verdict, mix_corr=corr, mix_lag=lag, mix_drift=drift)
     verdict = result.verdict
 
     if verdict in ("pass", "fail") and not dry_run:
@@ -1204,8 +1208,8 @@ def csv_cells(row: dict) -> dict:
     """CSV cells. Checkpoint lists are stored as JSON text."""
     out: dict = {}
     for key, value in row.items():
-        if isinstance(value, (list, tuple)):
-            out[key] = json.dumps(list(value), ensure_ascii=False)
+        if isinstance(value, (list, tuple, dict)):
+            out[key] = json.dumps(value, ensure_ascii=False)
         else:
             out[key] = value
     return out

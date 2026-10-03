@@ -19,7 +19,7 @@ from pathlib import Path
 
 import numpy as np
 import soundfile as sf
-from PyQt6.QtCore import QEvent, QPoint, QSize, QThread, Qt, QTimer, pyqtSignal
+from PyQt6.QtCore import QEvent, QPoint, QPointF, QRectF, QSize, QThread, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import (
     QAction,
     QColor,
@@ -1656,7 +1656,10 @@ class Timeline(QWidget):
                 edge = QColor(SECTION_DRAG_EDGE)
             p.fillRect(int(x0), top + 4, max(1, int(x1 - x0)), bot - top - 8, fill)
             p.setPen(QPen(edge, 1))
-            p.drawRect(int(x0), top + 4, max(1, int(x1 - x0)), bot - top - 8)
+            y0 = top + 4
+            y1 = bot - 4
+            p.drawLine(int(x0), y0, int(x1), y0)
+            p.drawLine(int(x0), y1, int(x1), y1)
             self._draw_wave(
                 p,
                 self.aca_peaks,
@@ -1665,12 +1668,47 @@ class Timeline(QWidget):
                 wave,
                 (sec.src0, sec.src1, sec.dst0, sec.out_dur),
             )
+        for i in range(len(self.sections) - 1):
+            boundary = float(self.sections[i].dst1)
+            x = self._t_to_x(boundary)
+            if x < 0 or x > self.width():
+                continue
+            active = hot is not None and (
+                (hot[0] == i and hot[1] == "right") or (hot[0] == i + 1 and hot[1] == "left")
+            )
+            self._draw_split_pin(p, x, top, bot, active=active)
         if hot is None or not (0 <= hot[0] < len(self.sections)):
             return
         sec = self.sections[hot[0]]
         where = "top" if hot[1] == "right" else "bottom"
         ex = sec.dst1 if hot[1] == "right" else sec.dst0
         self._draw_clock(p, self._t_to_x(ex), top, bot, where)
+
+    def _draw_split_pin(self, p: QPainter, x: float, top: int, bot: int, *, active: bool) -> None:
+        """Vertical split with a capsule at each end, so the cut reads as a handle."""
+        handle_w = 7.0
+        handle_h = 18.0
+        y0 = float(top) + 6.0
+        y1 = float(bot) - 6.0 - handle_h
+        if y1 <= y0 + 8:
+            return
+        p.save()
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        core = QColor("#f4f8ff") if active else QColor("#e8eef8")
+        fill = QColor("#c5ddff") if active else QColor("#8ebcf2")
+        glow = QColor(158, 196, 246, 110 if active else 64)
+        p.setPen(QPen(glow, 3.0, Qt.PenStyle.SolidLine, Qt.PenCapStyle.FlatCap))
+        p.drawLine(QPointF(x, y0 + handle_h * 0.45), QPointF(x, y1 + handle_h * 0.55))
+        p.setPen(QPen(core, 1.2, Qt.PenStyle.SolidLine, Qt.PenCapStyle.FlatCap))
+        p.drawLine(QPointF(x, y0 + 2.0), QPointF(x, y1 + handle_h - 2.0))
+        for y in (y0, y1):
+            rect = QRectF(x - handle_w / 2.0, y, handle_w, handle_h)
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(fill)
+            p.drawRoundedRect(rect, handle_w / 2.0, handle_w / 2.0)
+            p.setBrush(QColor(255, 255, 255, 160 if active else 120))
+            p.drawRoundedRect(QRectF(x - 1.15, y + 3.5, 2.3, handle_h - 7.0), 1.15, 1.15)
+        p.restore()
 
     def _draw_clock(self, p: QPainter, x: float, top: int, bot: int, where: str) -> None:
         cx = int(x)
