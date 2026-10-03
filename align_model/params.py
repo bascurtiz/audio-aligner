@@ -13,8 +13,6 @@ FEATURE_NAMES = ("chroma", "onset", "spectral", "waveform")
 class TrackProfile:
     name: str
     max_pad_sec: float
-    corr_min: float
-    drift_ms: float
     win_sec: float
     step_sec: float
     max_lag_sec: float
@@ -23,6 +21,11 @@ class TrackProfile:
     min_marker_sec: float = 2.0
     max_marker_sec: float = 30.0
     weak_score: float = 0.35
+    fit_tol_sec: float = 0.02
+    high_conf: float = 0.45
+    high_margin: float = 0.12
+    medium_conf: float = 0.25
+    medium_margin: float = 0.04
 
     def weight_map(self) -> dict[str, float]:
         return {name: float(self.weights.get(name, 0.0)) for name in FEATURE_NAMES}
@@ -33,19 +36,16 @@ def _profiles() -> dict[str, TrackProfile]:
         "default": TrackProfile(
             "default",
             max_pad_sec=90.0,
-            corr_min=0.35,
-            drift_ms=20.0,
             win_sec=8.0,
             step_sec=1.0,
             max_lag_sec=1.5,
             weights={"chroma": 0.30, "onset": 0.25, "spectral": 0.15, "waveform": 0.30},
             curvature_gain=1.0,
+            fit_tol_sec=0.020,
         ),
         "edm": TrackProfile(
             "edm",
             max_pad_sec=30.0,
-            corr_min=0.30,
-            drift_ms=25.0,
             win_sec=6.0,
             step_sec=0.5,
             max_lag_sec=1.0,
@@ -53,40 +53,38 @@ def _profiles() -> dict[str, TrackProfile]:
             curvature_gain=1.25,
             min_marker_sec=1.0,
             max_marker_sec=16.0,
+            fit_tol_sec=0.020,
         ),
         "acoustic": TrackProfile(
             "acoustic",
             max_pad_sec=90.0,
-            corr_min=0.32,
-            drift_ms=30.0,
             win_sec=10.0,
             step_sec=1.0,
             max_lag_sec=2.0,
             weights={"chroma": 0.35, "onset": 0.15, "spectral": 0.20, "waveform": 0.30},
             curvature_gain=0.85,
             max_marker_sec=40.0,
+            fit_tol_sec=0.030,
         ),
         "sparse_vocal": TrackProfile(
             "sparse_vocal",
             max_pad_sec=90.0,
-            corr_min=0.28,
-            drift_ms=35.0,
             win_sec=8.0,
             step_sec=1.0,
             max_lag_sec=2.0,
             weights={"chroma": 0.40, "onset": 0.05, "spectral": 0.15, "waveform": 0.40},
             curvature_gain=0.9,
+            fit_tol_sec=0.018,
         ),
     }
 
 
 PROFILES = _profiles()
 
-# The GUI and CLI send these on every run. They match the default profile,
-# so they are not treated as an override. A value the user changed still wins.
+# The GUI and CLI send this on every run. It matches the default profile,
+# so it is not treated as an override. A value the user changed still wins.
+# Correlation and drift gates are pass/fail policy, not model parameters.
 APP_MAX_PAD_SEC = 90.0
-APP_CORR_MIN = 0.35
-APP_DRIFT_MS = 20.0
 
 
 def _explicit(value: float | None, stock: float) -> float | None:
@@ -137,8 +135,6 @@ def resolve_profile(
     *,
     name: str | None = None,
     max_pad_sec: float | None = None,
-    corr_min: float | None = None,
-    drift_ms: float | None = None,
     win_sec: float | None = None,
     step_sec: float | None = None,
     max_lag_sec: float | None = None,
@@ -154,13 +150,9 @@ def resolve_profile(
     if weights:
         merged.update({k: float(v) for k, v in weights.items() if k in FEATURE_NAMES})
     max_pad_sec = _explicit(max_pad_sec, APP_MAX_PAD_SEC)
-    corr_min = _explicit(corr_min, APP_CORR_MIN)
-    drift_ms = _explicit(drift_ms, APP_DRIFT_MS)
     return TrackProfile(
         name=base.name if name is None else chosen,
         max_pad_sec=base.max_pad_sec if max_pad_sec is None else float(max_pad_sec),
-        corr_min=base.corr_min if corr_min is None else float(corr_min),
-        drift_ms=base.drift_ms if drift_ms is None else float(drift_ms),
         win_sec=base.win_sec if win_sec is None else float(win_sec),
         step_sec=base.step_sec if step_sec is None else float(step_sec),
         max_lag_sec=base.max_lag_sec if max_lag_sec is None else float(max_lag_sec),
@@ -169,4 +161,9 @@ def resolve_profile(
         min_marker_sec=base.min_marker_sec,
         max_marker_sec=base.max_marker_sec,
         weak_score=base.weak_score,
+        fit_tol_sec=base.fit_tol_sec,
+        high_conf=base.high_conf,
+        high_margin=base.high_margin,
+        medium_conf=base.medium_conf,
+        medium_margin=base.medium_margin,
     )

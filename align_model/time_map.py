@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from align_model.beats import beat_period, high_margin, safe_lag
+from align_model.beats import high_margin, safe_lag
 from align_model.decompose import AlignmentReport
 from align_model.evidence import HIGH_MARGIN, AlignmentEvidence
 from align_model.params import TrackProfile
@@ -12,7 +12,17 @@ from align_model.params import TrackProfile
 MAX_STRETCH = 0.08
 MAX_ACCEL = 0.02
 BEAT_WEIGHT = 0.35
-LINE_BAND_SEC = 0.22
+BAND_HIGH_SEC = 0.50
+BAND_MEDIUM_SEC = 0.15
+BAND_LOW_SEC = 0.05
+
+
+def _band_half(confidence: float, margin: float, *, high_conf: float, high_margin_min: float, medium_conf: float, medium_margin: float) -> float:
+    if high_margin(margin, confidence, margin_min=high_margin_min, conf_min=high_conf):
+        return BAND_HIGH_SEC
+    if confidence >= medium_conf and margin >= medium_margin:
+        return BAND_MEDIUM_SEC
+    return BAND_LOW_SEC
 
 
 def certainty_lags(
@@ -22,6 +32,11 @@ def certainty_lags(
     margins: np.ndarray,
     offset: float,
     slope: float,
+    *,
+    high_conf: float = 0.45,
+    high_margin_min: float = HIGH_MARGIN,
+    medium_conf: float = 0.25,
+    medium_margin: float = 0.04,
 ) -> tuple[np.ndarray, list[str]]:
     """High points keep the local lag. Low points sit on the robust line.
 
@@ -33,9 +48,9 @@ def certainty_lags(
     margin = np.asarray(margins, dtype=float)
     labels: list[str] = []
     for i in range(len(y)):
-        if i < len(conf) and i < len(margin) and high_margin(margin[i], conf[i]):
+        if i < len(conf) and i < len(margin) and high_margin(margin[i], conf[i], margin_min=high_margin_min, conf_min=high_conf):
             labels.append("high")
-        elif i < len(conf) and conf[i] >= 0.25 and i < len(margin) and margin[i] >= 0.04:
+        elif i < len(conf) and conf[i] >= medium_conf and i < len(margin) and margin[i] >= medium_margin:
             labels.append("medium")
         else:
             labels.append("low")
@@ -75,7 +90,7 @@ def spans_where(times: np.ndarray, labels: list[str], want: str) -> list[list[fl
     return spans
 
 
-def constrained_dtw(
+def solve_constrained_lag_path(
     times: np.ndarray,
     target: np.ndarray,
     confidence: np.ndarray,
@@ -87,10 +102,15 @@ def constrained_dtw(
     downbeats: np.ndarray | None = None,
     beat_weight: float = 0.0,
     beat_scores: np.ndarray | None = None,
+    query_events: np.ndarray | None = None,
     max_stretch: float = MAX_STRETCH,
     max_accel: float = MAX_ACCEL,
+    high_conf: float = 0.45,
+    high_margin_min: float = HIGH_MARGIN,
+    medium_conf: float = 0.25,
+    medium_margin: float = 0.04,
 ) -> np.ndarray:
-    """Monotonic lag path inside a band around the robust line.
+    """Monotonic lag path inside a confidence-sized band around the robust line.
 
     A jump is allowed only when the margin is high and the step is large.
     Ambiguous points are pulled onto the beat-snapped line.
@@ -111,14 +131,15 @@ def constrained_dtw(
     line = offset + slope * t
     beats = np.zeros(0) if beats is None else np.asarray(beats, dtype=float)
     downbeats = np.zeros(0) if downbeats is None else np.asarray(downbeats, dtype=float)
-    period = beat_period(beats) if beat_weight > 0 else 0.0
+    events = np.zeros(0) if query_events is None else np.asarray(query_events, dtype=float)
+    has_beats = beat_weight > 0 and beats.size >= 2
     scores = np.zeros(n) if beat_scores is None else np.asarray(beat_scores, dtype=float).reshape(-1)
     if len(scores) != n:
         scores = np.resize(scores, n)
     pull = target.copy()
     beat_w = np.zeros(n, dtype=float)
     for i in range(n):
-        if high_margin(float(margin[i]), float(conf[i])):
+        if high_margin(float(margin[i]), float(conf[i]), margin_min=high_margin_min, conf_min=high_conf):
             pull[i] = target[i]
             continue
         on_beat = float(scores[i]) >= 0.70
@@ -126,18 +147,18 @@ def constrained_dtw(
             pull[i] = target[i]
             beat_w[i] = beat_weight * 0.25
             continue
-        if period > 0.05 and float(margin[i]) < HIGH_MARGIN:
+        if has_beats and float(margin[i]) < high_margin_min:
             snapped, mult = safe_lag(
                 float(t[i]),
                 float(line[i]),
+                query_events=events,
                 beats=beats,
                 downbeats=downbeats,
-                period=period,
             )
             pull[i] = snapped
             beat_w[i] = beat_weight * mult * (1.0 - 0.5 * float(scores[i]))
         else:
-            pull[i] = float(line[i]) if float(conf[i]) < 0.25 else target[i]
+            pull[i] = float(line[i]) if float(conf[i]) < medium_conf else target[i]
 
     lo = float(min(pull.min(), line.min(), target.min()) - 0.05)
     hi = float(max(pull.max(), line.max(), target.max()) + 0.05)
@@ -158,9 +179,17 @@ def constrained_dtw(
         return float(cost)
 
     def band_mask(i: int) -> np.ndarray:
-        lo_i = float(line[i]) - LINE_BAND_SEC
-        hi_i = float(line[i]) + LINE_BAND_SEC
-        if high_margin(float(margin[i]), float(conf[i])):
+        half = _band_half(
+            float(conf[i]),
+            float(margin[i]),
+            high_conf=high_conf,
+            high_margin_min=high_margin_min,
+            medium_conf=medium_conf,
+            medium_margin=medium_margin,
+        )
+        lo_i = float(line[i]) - half
+        hi_i = float(line[i]) + half
+        if high_margin(float(margin[i]), float(conf[i]), margin_min=high_margin_min, conf_min=high_conf):
             lo_i = min(lo_i, float(target[i]) - 0.03)
             hi_i = max(hi_i, float(target[i]) + 0.03)
         return (grid >= lo_i) & (grid <= hi_i)
@@ -212,6 +241,11 @@ def constrained_dtw(
         if b < 0:
             b = int(np.argmin(np.abs(grid - pull[i - 1])))
     return _clamp_accel(t, out, max_accel)
+
+
+def constrained_dtw(*args, **kwargs):
+    """Older name. The solver is a constrained lag path, not feature DTW."""
+    return solve_constrained_lag_path(*args, **kwargs)
 
 
 def data_cost_row(i, grid, pull, conf, beat_w, scale) -> np.ndarray:
@@ -266,8 +300,9 @@ def adaptive_marker_times(
     max_spacing: float = 30.0,
     curvature_gain: float = 1.0,
     jump_times: list[float] | None = None,
+    scores: np.ndarray | None = None,
 ) -> np.ndarray:
-    """Denser pins where |d²lag/dt²| is large. Smooth stretches stay sparse."""
+    """Denser pins where confident curvature is large. A weak bend stays sparse."""
     t = np.asarray(times, dtype=float).reshape(-1)
     y = np.asarray(lags, dtype=float).reshape(-1)
     if len(t) < 2 or len(y) != len(t):
@@ -275,6 +310,10 @@ def adaptive_marker_times(
     order = np.argsort(t)
     t = t[order]
     y = y[order]
+    if scores is None or len(scores) != len(t):
+        conf = np.ones(len(t), dtype=float)
+    else:
+        conf = np.clip(np.asarray(scores, dtype=float).reshape(-1)[order], 0.0, 1.0)
     d1 = np.gradient(y, t)
     d2 = np.abs(np.gradient(d1, t)) * float(curvature_gain)
     thresh = 0.0015 / max(float(curvature_gain), 0.15)
@@ -285,7 +324,7 @@ def adaptive_marker_times(
     min_spacing = max(0.25, float(min_spacing))
     max_spacing = max(min_spacing, float(max_spacing))
     for i in range(1, len(t)):
-        acc += float(d2[i]) * float(t[i] - t[i - 1])
+        acc += float(d2[i]) * float(t[i] - t[i - 1]) * float(conf[i])
         span = float(t[i] - last)
         near_jump = any(abs(float(t[i]) - jt) <= 0.75 for jt in jumps)
         if span >= max_spacing or (span >= min_spacing and (acc >= thresh or near_jump)):
@@ -307,6 +346,7 @@ def src_dst_from_lags(
     max_spacing: float,
     curvature_gain: float,
     jump_times: list[float] | None = None,
+    scores: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """src = dst - lag, monotonic, with the 2% rate-step clamp."""
     t = np.asarray(times, dtype=float).reshape(-1)
@@ -322,6 +362,7 @@ def src_dst_from_lags(
         max_spacing=max_spacing,
         curvature_gain=curvature_gain,
         jump_times=jump_times,
+        scores=scores,
     )
     dst = dst[(dst >= -1e-6) & (dst <= target_sec + 1e-6)]
     if len(dst) == 0 or dst[0] > 1e-4:
@@ -380,11 +421,15 @@ def solve_time_map(
         evidence.margins,
         report.offset_sec,
         report.drift,
+        high_conf=profile.high_conf,
+        high_margin_min=profile.high_margin,
+        medium_conf=profile.medium_conf,
+        medium_margin=profile.medium_margin,
     )
     weight = 0.0 if beat_weight is None else float(beat_weight)
     if weight <= 0 and beats is not None and len(np.asarray(beats)) >= 4:
         weight = BEAT_WEIGHT
-    mapped = constrained_dtw(
+    mapped = solve_constrained_lag_path(
         times,
         target,
         evidence.scores,
@@ -395,6 +440,11 @@ def solve_time_map(
         downbeats=downbeats,
         beat_weight=weight,
         beat_scores=np.asarray([point.beat_score for point in evidence.points], dtype=float),
+        query_events=np.asarray(getattr(evidence, "query_onsets", []), dtype=float),
+        high_conf=profile.high_conf,
+        high_margin_min=profile.high_margin,
+        medium_conf=profile.medium_conf,
+        medium_margin=profile.medium_margin,
     )
     mapped = _monotonic_lag(times, mapped)
     jump_times = [j.time if hasattr(j, "time") else float(j["time"]) for j in report.jumps]
@@ -407,6 +457,7 @@ def solve_time_map(
         max_spacing=profile.max_marker_sec,
         curvature_gain=profile.curvature_gain,
         jump_times=jump_times,
+        scores=evidence.scores,
     )
     report.times = [float(v) for v in times]
     report.lags = [float(v) for v in mapped]

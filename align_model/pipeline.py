@@ -68,12 +68,18 @@ def map_stem(
     incoming = len(qry) / sr if sr else 0.0
     source_sec = incoming if in_sec is None else float(in_sec)
     if evidence is None:
-        evidence = extract_evidence(ref, qry, sr, profile=profile, kind=kind)
+        evidence = extract_evidence(ref, qry, sr, profile=profile, kind=kind, beats=beats, downbeats=downbeats)
     if beats is not None and len(beats) >= 4:
         attach_beat_scores(evidence, beats, np.asarray(downbeats if downbeats is not None else []))
     if len(evidence.points) < 2:
         return _empty_map(kind, profile, target, source_sec)
-    measured = decompose(evidence.times, evidence.lags, evidence.scores, weak_score=profile.weak_score)
+    measured = decompose(
+        evidence.times,
+        evidence.lags,
+        evidence.scores,
+        weak_score=profile.weak_score,
+        fit_tol_sec=profile.fit_tol_sec,
+    )
     if evidence.low_signal_frac > measured.weak_frac:
         measured.weak_frac = float(evidence.low_signal_frac)
     _times, mapped, src, dst = solve_time_map(
@@ -151,20 +157,21 @@ def _model_phrase(
     if query.size < int(0.8 * sr):
         return None
     d0 = int(max(0.0, unit.dst_start) * sr)
-    reference = np.asarray(ref[d0 : d0 + query.size], dtype=np.float32)
+    lead = int(0.05 * query.size)
+    extra = int(0.30 * query.size)
+    r0 = max(0, d0 - lead)
+    r1 = min(len(ref), d0 + query.size + extra)
+    reference = np.asarray(ref[r0:r1], dtype=np.float32)
     if reference.size < int(0.8 * sr):
         return None
-    n = min(len(reference), len(query))
-    reference = reference[:n]
-    query = query[:n]
     local = replace(
         profile,
         win_sec=min(profile.win_sec, max(1.2, dur / 2.0)),
         step_sec=min(profile.step_sec, max(0.3, min(profile.win_sec, max(1.2, dur / 2.0)) / 3.0)),
-        max_lag_sec=min(profile.max_lag_sec, max(0.35, dur * 0.25)),
+        max_lag_sec=min(profile.max_lag_sec, max(0.45, dur * 0.35)),
     )
-    origin = d0 / float(sr)
-    end = origin + n / float(sr)
+    origin = r0 / float(sr)
+    end = origin + len(reference) / float(sr)
     beat_arr = np.asarray([] if beats is None else beats, dtype=float)
     down_arr = np.asarray([] if downbeats is None else downbeats, dtype=float)
     beat_arr = beat_arr[(beat_arr >= origin) & (beat_arr <= end)] - origin
@@ -177,8 +184,8 @@ def _model_phrase(
         profile=local,
         beats=beat_arr if beat_arr.size >= 4 else None,
         downbeats=down_arr if down_arr.size else None,
-        target_sec=n / float(sr),
-        in_sec=n / float(sr),
+        target_sec=len(reference) / float(sr),
+        in_sec=len(query) / float(sr),
     )
     if len(stem.src) < 2:
         return None
@@ -190,8 +197,8 @@ def _model_phrase(
     for src, dst, nxt_src, nxt_dst in zip(stem.src[:-1], stem.dst[:-1], stem.src[1:], stem.dst[1:]):
         src0 = float(unit.src_start) + float(src)
         src1 = float(unit.src_start) + float(nxt_src)
-        dst0 = float(unit.dst_start) + shift + float(dst)
-        dst1 = float(unit.dst_start) + shift + float(nxt_dst)
+        dst0 = origin + shift + float(dst)
+        dst1 = origin + shift + float(nxt_dst)
         if src1 - src0 < 0.03 or dst1 - dst0 < 0.03:
             continue
         spans.append(MapSpan("speech", src0, src1, dst0, dst1))
@@ -272,7 +279,7 @@ def map_vocal_gaps(
             if times[cursor] >= unit.dst_start - 1e-6:
                 scores[cursor] = unit.confidence
             cursor += 1
-    measured = decompose(times, lags, scores, weak_score=profile.weak_score)
+    measured = decompose(times, lags, scores, weak_score=profile.weak_score, fit_tol_sec=profile.fit_tol_sec)
     measured.profile = profile.name
     measured.gap_inserts = gaps
     measured.confidence = gap_confidence(units)

@@ -45,6 +45,7 @@ class AlignmentEvidence:
     profile: str = "default"
     kind: str = "vocal"
     low_signal_frac: float = 0.0
+    query_onsets: list = field(default_factory=list)
 
     @property
     def times(self) -> np.ndarray:
@@ -115,6 +116,8 @@ def fuse_candidates(
     weights: dict[str, float],
     *,
     cluster_sec: float = 0.04,
+    beat_at=None,
+    beat_weight: float = 0.35,
 ) -> tuple[float, float, float, float] | None:
     """Cluster feature lags. Return lag, confidence, second score, margin.
 
@@ -127,7 +130,8 @@ def fuse_candidates(
         weight = float(weights.get(name, 0.0))
         if best <= 0.02 or weight <= 0.0:
             continue
-        alive.append((name, float(lag), float(best), float(second), weight))
+        beat = 0.0 if beat_at is None else float(beat_at(float(lag)))
+        alive.append((name, float(lag), float(best), float(second), weight * (1.0 + beat_weight * beat)))
     if not alive:
         return None
     weight_sum = sum(item[4] for item in alive) or 1.0
@@ -231,17 +235,16 @@ def extract_evidence(
     *,
     profile: TrackProfile,
     kind: str = "vocal",
+    beats: np.ndarray | None = None,
+    downbeats: np.ndarray | None = None,
 ) -> AlignmentEvidence:
     """Sliding multi-feature match. Silent query windows are dropped."""
     import librosa
 
     ref = np.asarray(ref, dtype=np.float32).reshape(-1)
     qry = np.asarray(qry, dtype=np.float32).reshape(-1)
-    n = min(len(ref), len(qry))
-    ref = ref[:n]
-    qry = qry[:n]
     evidence = AlignmentEvidence(profile=profile.name, kind=kind)
-    if sr <= 0 or n < int(sr * 0.5):
+    if sr <= 0 or len(qry) < int(sr * 0.5) or len(ref) < int(sr * 0.5):
         evidence.low_signal_frac = 1.0
         return evidence
 
@@ -255,20 +258,27 @@ def extract_evidence(
     mel_r = np.log1p(librosa.feature.melspectrogram(y=ref, sr=sr, n_mels=16, hop_length=HOP))
     mel_q = np.log1p(librosa.feature.melspectrogram(y=qry, sr=sr, n_mels=16, hop_length=HOP))
     rms = librosa.feature.rms(y=qry, hop_length=HOP)[0]
-    frames = min(chroma_r.shape[1], chroma_q.shape[1], len(onset_r), len(onset_q), mel_r.shape[1], mel_q.shape[1], len(rms))
-    chroma_r, chroma_q = chroma_r[:, :frames], chroma_q[:, :frames]
-    onset_r, onset_q = onset_r[:frames], onset_q[:frames]
-    mel_r, mel_q = mel_r[:, :frames], mel_q[:, :frames]
-    rms = rms[:frames]
+    q_frames = min(chroma_q.shape[1], len(onset_q), mel_q.shape[1], len(rms))
+    r_frames = min(chroma_r.shape[1], len(onset_r), mel_r.shape[1])
+    chroma_q, onset_q, mel_q, rms = chroma_q[:, :q_frames], onset_q[:q_frames], mel_q[:, :q_frames], rms[:q_frames]
+    chroma_r, onset_r, mel_r = chroma_r[:, :r_frames], onset_r[:r_frames], mel_r[:, :r_frames]
+    frames = q_frames
     rms_thr = max(float(np.percentile(rms, 60)) * 0.35, 1e-5) if rms.size else 1e-5
 
     wave_r = _decimate(ref, sr, WAVE_SR)
     wave_q = _decimate(qry, sr, WAVE_SR)
     wave_hop = max(1, int(round(HOP * WAVE_SR / sr)))
 
+    from align_model.beats import beat_alignment_score, onset_event_times
+
+    evidence.query_onsets = [float(v) for v in onset_event_times(onset_q, hop_sec)]
+    query_onsets = np.asarray(evidence.query_onsets, dtype=float)
+    beat_grid = np.asarray([] if beats is None else beats, dtype=float)
+    down_grid = np.asarray([] if downbeats is None else downbeats, dtype=float)
     win = max(8, int(profile.win_sec / hop_sec))
     step = max(1, int(profile.step_sec / hop_sec))
     max_lag = max(2, int(profile.max_lag_sec / hop_sec))
+    ref_extra = max_lag if r_frames > q_frames + max_lag else 0
     considered = 0
     dropped = 0
     base = profile.weight_map()
@@ -278,16 +288,18 @@ def extract_evidence(
         if float(np.mean(rms[start:end])) < rms_thr:
             dropped += 1
             continue
-        c_frames, c_vals = _frame_corr(chroma_r[:, start:end], chroma_q[:, start:end], max_lag)
+        rend = min(r_frames, end + ref_extra)
+        c_frames, c_vals = _frame_corr(chroma_r[:, start:rend], chroma_q[:, start:end], max_lag)
         c_lag, c_best, _c2_lag, c_second = best_and_second(c_vals, c_frames * hop_sec)
-        o_frames, o_vals = _frame_corr(onset_r[start:end], onset_q[start:end], max_lag)
+        o_frames, o_vals = _frame_corr(onset_r[start:rend], onset_q[start:end], max_lag)
         o_lag, o_best, _o2, o_second = best_and_second(o_vals, o_frames * hop_sec)
-        s_frames, s_vals = _frame_corr(mel_r[:, start:end], mel_q[:, start:end], max_lag)
+        s_frames, s_vals = _frame_corr(mel_r[:, start:rend], mel_q[:, start:end], max_lag)
         s_lag, s_best, _s2, s_second = best_and_second(s_vals, s_frames * hop_sec)
         w0 = int(start * wave_hop)
         w1 = int(end * wave_hop)
         wave_max = max(2, int(profile.max_lag_sec * WAVE_SR))
-        w_lag, w_best, _w2, w_second = _wave_peaks(wave_r[w0:w1], wave_q[w0:w1], wave_max)
+        wave_end = w1 + (wave_max if ref_extra else 0)
+        w_lag, w_best, _w2, w_second = _wave_peaks(wave_r[w0:wave_end], wave_q[w0:w1], wave_max)
         w_lag = w_lag / float(WAVE_SR)
         candidates = [
             ("chroma", c_lag, c_best, 0.0, c_second),
@@ -296,12 +308,20 @@ def extract_evidence(
             ("waveform", w_lag, w_best, 0.0, w_second),
         ]
         weights = context_weights(base, chroma=c_best, onset=o_best, kind=kind)
-        fused = fuse_candidates(candidates, weights)
+        center = (start + (end - start) / 2.0) * hop_sec
+        half = profile.win_sec * 0.5 + profile.max_lag_sec
+
+        def beat_at(lag: float, _center=center, _half=half) -> float:
+            if beat_grid.size < 2 or query_onsets.size == 0:
+                return 0.0
+            near = query_onsets[np.abs(query_onsets - _center) <= _half]
+            return beat_alignment_score(lag, near if near.size else query_onsets, beat_grid, down_grid)
+
+        fused = fuse_candidates(candidates, weights, beat_at=beat_at if beat_grid.size >= 2 else None)
         if fused is None:
             dropped += 1
             continue
         lag, confidence, second, margin = fused
-        center = (start + (end - start) / 2.0) * hop_sec
         evidence.points.append(
             EvidencePoint(
                 time=float(center),
@@ -311,6 +331,7 @@ def extract_evidence(
                 onset=float(o_best),
                 spectral=float(s_best),
                 waveform=float(w_best),
+                beat_score=float(beat_at(lag)),
                 best_score=float(confidence),
                 second_score=float(second),
                 match_margin=float(margin),

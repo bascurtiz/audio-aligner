@@ -69,7 +69,7 @@ def _mad(values: np.ndarray) -> float:
     return float(np.median(np.abs(values - med))) * 1.4826
 
 
-def _ransac_line(times: np.ndarray, lags: np.ndarray) -> tuple[float, float, np.ndarray]:
+def _ransac_line(times: np.ndarray, lags: np.ndarray, *, thresh: float = 0.02) -> tuple[float, float, np.ndarray]:
     n = len(times)
     mask = np.ones(n, dtype=bool)
     if n == 0:
@@ -77,7 +77,7 @@ def _ransac_line(times: np.ndarray, lags: np.ndarray) -> tuple[float, float, np.
     if n == 1:
         return float(lags[0]), 0.0, mask
     rng = np.random.default_rng(0)
-    thresh = 0.03
+    thresh = float(thresh)
     best_inliers = mask
     best_count = -1
     best = (float(np.median(lags)), 0.0)
@@ -111,6 +111,8 @@ def robust_line(
     times: np.ndarray,
     lags: np.ndarray,
     scores: np.ndarray | None = None,
+    *,
+    fit_tol_sec: float = 0.02,
 ) -> tuple[float, float, np.ndarray]:
     """Return intercept, slope, and an inlier mask. Tiny clouds use RANSAC."""
     t = np.asarray(times, dtype=float).reshape(-1)
@@ -119,16 +121,16 @@ def robust_line(
     if n == 0:
         return 0.0, 0.0, np.zeros(0, dtype=bool)
     if n < 6:
-        return _ransac_line(t, y)
+        return _ransac_line(t, y, thresh=fit_tol_sec)
     try:
         slope, intercept, _lo, _hi = stats.theilslopes(y, t)
         offset = float(intercept)
         slope = float(slope)
     except (ValueError, np.linalg.LinAlgError):
-        return _ransac_line(t, y)
+        return _ransac_line(t, y, thresh=fit_tol_sec)
     resid = y - (offset + slope * t)
     scale = _mad(resid)
-    tol = max(3.0 * scale, 0.02)
+    tol = max(3.0 * scale, float(fit_tol_sec))
     mask = np.abs(resid) <= tol
     if int(np.count_nonzero(mask)) < max(3, n // 5):
         mask = np.ones(n, dtype=bool)
@@ -190,6 +192,7 @@ def decompose(
     scores: np.ndarray | None = None,
     *,
     weak_score: float = WEAK_SCORE,
+    fit_tol_sec: float = 0.02,
 ) -> AlignmentReport:
     """Measure offset, linear drift, nonlinear residual, and discontinuities."""
     t = np.asarray(times, dtype=float).reshape(-1)
@@ -201,7 +204,7 @@ def decompose(
     report = AlignmentReport()
     if len(t) == 0 or len(y) == 0 or len(t) != len(y):
         return report
-    offset, slope, line_mask = robust_line(t, y, sc)
+    offset, slope, line_mask = robust_line(t, y, sc, fit_tol_sec=fit_tol_sec)
     jumps, jump_mask = find_jumps(t, y, sc, offset, slope)
     inlier = line_mask & ~jump_mask
     if int(np.count_nonzero(inlier)) < 2:

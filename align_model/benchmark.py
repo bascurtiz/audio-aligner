@@ -238,6 +238,77 @@ def case_sparse() -> dict:
     return out
 
 
+def _chirp_offset(name: str, delay: float):
+    """A rising tone, so a shift cannot hide on the click grid."""
+
+    def run() -> dict:
+        n = int(6.0 * SR)
+        t = np.arange(n) / SR
+        ref = np.sin(2 * np.pi * (140.0 * t + 5.0 * t * t)).astype(np.float32)
+        qry = apply_lag(ref, SR, lambda t, d=delay: d)
+        out = _fit(ref, qry, lambda t, d=delay: -d, max_lag=0.6)
+        out["name"] = name
+        out["true_offset"] = -delay
+        return out
+
+    return run
+
+
+def _offset_case(name: str, f0: float, delay: float, *, dur: float = 6.0, max_lag: float = 0.6):
+    def run() -> dict:
+        ref = harmonic(SR, dur, f0)
+        qry = apply_lag(ref, SR, lambda t, d=delay: d)
+        out = _fit(ref, qry, lambda t, d=delay: -d, max_lag=max_lag)
+        out["name"] = name
+        out["true_offset"] = -delay
+        return out
+
+    return run
+
+
+def _drift_case(name: str, f0: float, slope: float):
+    def run() -> dict:
+        ref = harmonic(SR, 6.0, f0)
+        qry = apply_lag(ref, SR, lambda t, s=slope: s * np.asarray(t, dtype=float))
+        out = _fit(ref, qry, lambda t, s=slope: -s * float(np.asarray(t)), max_lag=0.6)
+        out["name"] = name
+        out["true_slope"] = -slope
+        return out
+
+    return run
+
+
+def _combined_case(name: str, f0: float, offset: float, slope: float):
+    def delay(t, o=offset, s=slope):
+        return o + s * np.asarray(t, dtype=float)
+
+    def run() -> dict:
+        ref = harmonic(SR, 6.0, f0)
+        qry = apply_lag(ref, SR, delay)
+        out = _fit(ref, qry, lambda t: -float(delay(t)), max_lag=0.7)
+        out["name"] = name
+        return out
+
+    return run
+
+
+def _step_case(name: str, f0: float, at: float, size: float):
+    def delay(t, at=at, size=size):
+        return np.where(np.asarray(t, dtype=float) < at, 0.0, size)
+
+    def run() -> dict:
+        n = int(6.0 * SR)
+        t = np.arange(n) / SR
+        ref = np.sin(2 * np.pi * (f0 * t + 4.0 * t * t)).astype(np.float32)
+        qry = apply_lag(ref, SR, delay)
+        out = _fit(ref, qry, lambda t: -float(np.asarray(delay(t))), max_lag=0.5)
+        out["name"] = name
+        out["true_jumps"] = [at]
+        return out
+
+    return run
+
+
 CASES = (
     case_perfect,
     case_offset,
@@ -248,6 +319,21 @@ CASES = (
     case_tempo_change,
     case_noise,
     case_sparse,
+    _offset_case("offset_50ms", 180.0, 0.05),
+    _offset_case("offset_80ms", 210.0, 0.08),
+    _chirp_offset("offset_220ms", 0.22),
+    _offset_case("offset_350ms", 150.0, 0.35, max_lag=0.8),
+    _offset_case("query_early_100ms", 260.0, -0.10),
+    _offset_case("offset_low_f0", 110.0, 0.12),
+    _offset_case("offset_high_f0", 440.0, 0.18),
+    _drift_case("drift_slow", 190.0, 0.004),
+    _drift_case("drift_mid", 230.0, 0.008),
+    _drift_case("drift_fast", 160.0, 0.018),
+    _drift_case("drift_negative", 200.0, -0.007),
+    _combined_case("offset_plus_drift", 175.0, 0.08, 0.006),
+    _step_case("step_100ms", 90.0, 3.0, 0.10),
+    _step_case("step_80ms", 120.0, 2.5, 0.08),
+    _offset_case("offset_30ms", 300.0, 0.03),
 )
 
 

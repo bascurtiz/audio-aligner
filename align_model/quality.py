@@ -78,6 +78,25 @@ def apply_codes(
     return data
 
 
+def post_render_validation(aca, inst, orig, **kwargs) -> dict:
+    """Score the rendered mix against the original.
+
+    This is an independent check. It is not the alignment model's own confidence.
+    """
+    from check_alignment import analyze_alignment
+
+    verdict, corr, lag, drift, weak, notes = analyze_alignment(aca, inst, orig, **kwargs)
+    return {
+        "source": "post_render_validation",
+        "verdict": verdict,
+        "corr": float(corr),
+        "lag_sec": float(lag),
+        "drift_ms": float(drift),
+        "weak_frac": float(weak),
+        "notes": notes,
+    }
+
+
 def relationship(verdict: str, corr: float, lag_sec: float, drift_ms: float) -> dict:
     return {
         "verdict": verdict,
@@ -133,6 +152,7 @@ def stamp_result(result, *, mix_verdict: str, mix_corr: float, mix_lag: float, m
         float(getattr(result, "inst_check_drift_ms", 0.0) or 0.0),
     )
     mix = relationship(mix_verdict, mix_corr, mix_lag, mix_drift)
+    mix["source"] = "post_render_validation"
     if "vocal_confidence" in report:
         vocal["confidence"] = float(report.get("vocal_confidence") or 0.0)
     if "inst_confidence" in report:

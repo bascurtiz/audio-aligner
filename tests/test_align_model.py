@@ -19,7 +19,7 @@ from align_model.benchmark import (
     discontinuity_counts,
     measure_curve,
 )
-from align_model.beats import beat_score_at
+from align_model.beats import beat_alignment_score
 from align_model.evidence import EvidencePoint, context_weights, fuse_candidates
 from align_model.gaps import PhraseUnit, render_gap_aware, spans_from_units
 from align_model.params import resolve_profile
@@ -91,9 +91,12 @@ class EvidenceTests(unittest.TestCase):
             weights,
         )
         self.assertLess(ambiguous[3], clear[3])
-        beats = np.arange(0.0, 4.0, 0.5)
-        self.assertGreater(beat_score_at(1.0, 0.0, beats, beats[::4], 0.5), 0.8)
-        self.assertLess(beat_score_at(1.0, 0.2, beats, beats[::4], 0.5), 0.4)
+        beats = np.array([98.0, 98.5, 99.0, 99.5, 100.0, 100.5])
+        event = np.array([99.94])
+        landed = beat_alignment_score(0.06, event, beats, np.zeros(0))
+        off_beat = beat_alignment_score(0.25, event, beats, np.zeros(0))
+        self.assertGreater(landed, 0.85)
+        self.assertGreater(landed, off_beat)
 
 
 class TimeMapTests(unittest.TestCase):
@@ -167,6 +170,10 @@ class TimeMapTests(unittest.TestCase):
             curvature_gain=1.2,
         )
         self.assertGreater(len(curved), len(straight))
+        mild = 0.0005 * times ** 2
+        full = adaptive_marker_times(times, mild, min_spacing=2.0, max_spacing=30.0)
+        weak = adaptive_marker_times(times, mild, min_spacing=2.0, max_spacing=30.0, scores=np.full(len(times), 0.1))
+        self.assertLess(len(weak), len(full))
 
 
 class GapTests(unittest.TestCase):
@@ -276,16 +283,30 @@ class BenchmarkTests(unittest.TestCase):
         self.assertEqual(missed, 0)
         self.assertLessEqual(false_pos, 2)
 
+    def test_ground_truth_suite(self) -> None:
+        from align_model.benchmark import run_all
+
+        rows = run_all()
+        self.assertGreaterEqual(len(rows), 24)
+        for row in rows:
+            self.assertTrue(row["monotonic"], row["name"])
+            if row["name"] == "missing_internal_gaps":
+                self.assertTrue(any(0.7 <= dur <= 2.4 for dur in row["durations"]))
+                continue
+            self.assertLess(row["errors"]["mae"], 0.25, row["name"])
+
     def test_profile_override(self) -> None:
-        profile = resolve_profile(None, 0, name="edm", drift_ms=12.0, win_sec=5.0)
+        profile = resolve_profile(None, 0, name="edm", win_sec=5.0)
         self.assertEqual(profile.name, "edm")
-        self.assertEqual(profile.drift_ms, 12.0)
         self.assertEqual(profile.win_sec, 5.0)
         self.assertGreater(profile.weights["onset"], profile.weights["chroma"])
-        stock = resolve_profile(None, 0, name="edm", max_pad_sec=90.0, corr_min=0.35, drift_ms=20.0)
+        self.assertFalse(hasattr(profile, "corr_min"))
+        self.assertFalse(hasattr(profile, "drift_ms"))
+        self.assertAlmostEqual(profile.fit_tol_sec, 0.020)
+        self.assertAlmostEqual(resolve_profile(None, 0, name="acoustic").fit_tol_sec, 0.030)
+        self.assertAlmostEqual(resolve_profile(None, 0, name="sparse_vocal").fit_tol_sec, 0.018)
+        stock = resolve_profile(None, 0, name="edm", max_pad_sec=90.0)
         self.assertEqual(stock.max_pad_sec, 30.0)
-        self.assertEqual(stock.corr_min, 0.30)
-        self.assertEqual(stock.drift_ms, 25.0)
 
 
 if __name__ == "__main__":

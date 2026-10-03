@@ -1151,12 +1151,8 @@ def _process_folder_model(
         orig_m,
         SR_ANALYSIS,
         max_pad_sec=max_pad_sec,
-        corr_min=corr_min,
-        drift_ms=drift_ms,
     )
     max_pad_sec = profile.max_pad_sec
-    corr_min = profile.corr_min
-    drift_ms = profile.drift_ms
     aca_pad, aca_score = chroma_xcorr_pad(
         orig_vox, aca_vox, sr=SR_ANALYSIS, max_pad_sec=max_pad_sec
     )
@@ -1343,7 +1339,9 @@ def _process_folder_model(
         result.verdict = "error"
         result.notes += f"; post_scan:{scan_notes}"
         return
-    mix_verdict, corr, lag, drift, _weak, notes = analyze_alignment(
+    from align_model.quality import post_render_validation
+
+    checked = post_render_validation(
         aca,
         inst,
         orig2,
@@ -1352,6 +1350,21 @@ def _process_folder_model(
         window_corr_min=window_corr_min,
         weak_window_frac=weak_window_frac,
     )
+    mix_verdict, corr, lag, drift, notes = (
+        checked["verdict"],
+        checked["corr"],
+        checked["lag_sec"],
+        checked["drift_ms"],
+        checked["notes"],
+    )
+    if isinstance(result.alignment_report, dict):
+        result.alignment_report["validation"] = "post_render"
+        result.alignment_report["post_render"] = {
+            "verdict": mix_verdict,
+            "corr": corr,
+            "lag_sec": lag,
+            "drift_ms": drift,
+        }
     result.corr = corr
     result.lag_sec = lag
     result.drift_ms = drift
