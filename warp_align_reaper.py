@@ -574,7 +574,12 @@ def stage_stem_reaper(
     rendered = tmp_path / "rendered.wav"
     in_sec = write_padded_wav(src, padded, pad_sec=pad_sec, target_sr=target_sr)
     if src_dst is not None:
-        src_s, dst_s = src_dst
+        from align_model.time_map import source_on_padded_wav
+
+        # Model src is an original-stem time. The file above has pad_sec of
+        # pre-roll before that time 0, so the marker reads src + pad_sec.
+        src_s = source_on_padded_wav(src_dst[0], pad_sec)
+        dst_s = src_dst[1]
         markers = [{"src": float(s), "dst": float(d)} for s, d in zip(src_s, dst_s)]
     else:
         markers = markers_from_lag(
@@ -800,7 +805,6 @@ def reprocess_edited_acapella(
         target_frames=info.frames,
         reaper_exe=reaper_exe,
         declick=False,
-        follow_lag=True,
         scores=sc_ae,
         grid_sec=bar_grid,
         src_dst=aca_src_dst,
@@ -907,7 +911,6 @@ def reprocess_edited_instrumental(
         target_frames=info.frames,
         reaper_exe=reaper_exe,
         declick=False,
-        follow_lag=True,
         scores=sc_i,
         grid_sec=bar_grid,
         stretch_mode="transient",
@@ -1272,7 +1275,6 @@ def _process_folder_model(
                     lags=aca_map.lags,
                     target_sr=info.samplerate,
                     target_frames=info.frames,
-                    follow_lag=True,
                     scores=aca_map.scores,
                     grid_sec=bar_grid,
                     src_dst=(aca_map.src, aca_map.dst),
@@ -1287,7 +1289,6 @@ def _process_folder_model(
                 lags=inst_map.lags,
                 target_sr=info.samplerate,
                 target_frames=info.frames,
-                follow_lag=True,
                 scores=inst_map.scores,
                 stretch_mode="transient",
                 grid_sec=bar_grid,

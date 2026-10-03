@@ -25,7 +25,7 @@ from align_model.gaps import PhraseUnit, render_gap_aware, spans_from_units
 from align_model.params import resolve_profile
 from align_model.pipeline import map_from_points
 from align_model.quality import apply_codes, is_compensating, stamp_result
-from align_model.time_map import adaptive_marker_times
+from align_model.time_map import adaptive_marker_times, solve_constrained_lag_path, source_on_padded_wav
 
 
 class DecomposeTests(unittest.TestCase):
@@ -175,6 +175,66 @@ class TimeMapTests(unittest.TestCase):
         weak = adaptive_marker_times(times, mild, min_spacing=2.0, max_spacing=30.0, scores=np.full(len(times), 0.1))
         self.assertLess(len(weak), len(full))
 
+    def test_jump_can_leave_a_confident_point(self) -> None:
+        times = np.array([0.0, 0.5, 1.0, 1.5, 2.0])
+        target = np.array([0.0, 0.0, 0.08, 0.08, 0.08])
+        solved = solve_constrained_lag_path(
+            times,
+            target,
+            np.full(5, 0.8),
+            np.array([0.40, 0.40, 0.05, 0.40, 0.40]),
+            0.0,
+            0.0,
+            high_conf=0.45,
+            high_margin_min=0.12,
+        )
+        self.assertGreater(float(solved[2]), 0.06)
+
+    def test_pad_is_preroll_before_source_zero(self) -> None:
+        """A source event at 9.900 s with lag +0.100 s lands at reference 10.000 s."""
+        points = [
+            EvidencePoint(
+                time=float(t),
+                lag=0.10,
+                confidence=0.85,
+                best_score=0.85,
+                second_score=0.1,
+                match_margin=0.4,
+            )
+            for t in np.arange(0.5, 12.0, 0.5)
+        ]
+        stem = map_from_points(points, target_sec=12.0, in_sec=12.0)
+        self.assertAlmostEqual(stem.pad_sec, 0.10, delta=0.03)
+        src_at = float(np.interp(10.0, stem.dst, stem.src))
+        self.assertAlmostEqual(src_at, 9.90, delta=0.04)
+        file_at = float(source_on_padded_wav(np.array([src_at]), stem.pad_sec)[0])
+        self.assertAlmostEqual(file_at, 10.0, delta=0.04)
+
+        sr = 1000
+        stem_audio = np.zeros(12 * sr, dtype=np.float32)
+        stem_audio[int(round(9.9 * sr))] = 1.0
+        pad_n = int(round(stem.pad_sec * sr))
+        padded = np.concatenate([np.zeros(pad_n, dtype=np.float32), stem_audio])
+        self.assertEqual(float(padded[int(round(file_at * sr))]), 1.0)
+
+        late = [
+            EvidencePoint(
+                time=float(t),
+                lag=-0.10,
+                confidence=0.85,
+                best_score=0.85,
+                second_score=0.1,
+                match_margin=0.4,
+            )
+            for t in np.arange(0.5, 12.0, 0.5)
+        ]
+        trimmed = map_from_points(late, target_sec=12.0, in_sec=12.0)
+        self.assertAlmostEqual(trimmed.pad_sec, -0.10, delta=0.03)
+        src_late = float(np.interp(10.0, trimmed.dst, trimmed.src))
+        self.assertAlmostEqual(src_late, 10.10, delta=0.04)
+        file_late = float(source_on_padded_wav(np.array([src_late]), trimmed.pad_sec)[0])
+        self.assertAlmostEqual(file_late, 10.0, delta=0.04)
+
 
 class GapTests(unittest.TestCase):
     def test_stall_is_silence_and_monotonic(self) -> None:
@@ -193,6 +253,36 @@ class GapTests(unittest.TestCase):
         i0 = int(silence.dst_start * 8000) + 20
         i1 = int(silence.dst_end * 8000) - 20
         self.assertLess(float(np.max(np.abs(out[i0:i1]))), 1e-6)
+
+    def test_two_phrases_keep_their_reference_slots(self) -> None:
+        """Removed internal silence stays silent, and each phrase keeps its reference slot."""
+        sr = 8000
+        phrase_a = np.sin(2 * np.pi * 196.0 * np.arange(4 * sr) / sr).astype(np.float32)
+        phrase_b = np.sin(2 * np.pi * 330.0 * np.arange(4 * sr) / sr).astype(np.float32)
+        acapella = np.concatenate([phrase_a, phrase_b])
+        units = [
+            PhraseUnit(0.0, 4.0, 5.0, 9.0, 5.0, 5.0, 0.0, 0.9, 0.4),
+            PhraseUnit(4.0, 8.0, 10.0, 14.0, 6.0, 6.0, 0.0, 0.9, 0.4),
+        ]
+        spans = spans_from_units(units, 15.0)
+        speech = [span for span in spans if span.kind == "speech"]
+        self.assertEqual(len(speech), 2)
+        self.assertAlmostEqual(speech[0].dst_start, 5.0, delta=0.05)
+        self.assertAlmostEqual(speech[1].dst_start, 10.0, delta=0.05)
+        out = render_gap_aware(acapella, sr, spans, 15 * sr, engine="linear")[:, 0]
+        gap = out[int(9.2 * sr) : int(9.8 * sr)]
+        self.assertLess(float(np.max(np.abs(gap))), 1e-6)
+        early = out[int(6.0 * sr) : int(8.0 * sr)]
+        late = out[int(11.0 * sr) : int(13.0 * sr)]
+        self.assertGreater(float(np.mean(np.abs(early))), 0.2)
+        self.assertGreater(float(np.mean(np.abs(late))), 0.2)
+
+        def peak_hz(y: np.ndarray) -> float:
+            spec = np.abs(np.fft.rfft(y))
+            return float(np.fft.rfftfreq(len(y), 1.0 / sr)[int(np.argmax(spec))])
+
+        self.assertLess(abs(peak_hz(early) - 196.0), 4.0)
+        self.assertLess(abs(peak_hz(late) - 330.0), 4.0)
 
 
 class QualityTests(unittest.TestCase):
@@ -287,13 +377,39 @@ class BenchmarkTests(unittest.TestCase):
         from align_model.benchmark import run_all
 
         rows = run_all()
-        self.assertGreaterEqual(len(rows), 24)
+        by_name = {row["name"]: row for row in rows}
+        self.assertGreaterEqual(len(rows), 32)
         for row in rows:
             self.assertTrue(row["monotonic"], row["name"])
             if row["name"] == "missing_internal_gaps":
                 self.assertTrue(any(0.7 <= dur <= 2.4 for dur in row["durations"]))
+                self.assertTrue(row["silence"])
                 continue
             self.assertLess(row["errors"]["mae"], 0.25, row["name"])
+        for name, truth in (
+            ("offset_50ms", -0.05),
+            ("offset_m50ms", 0.05),
+            ("offset_p200ms", -0.20),
+            ("offset_m200ms", 0.20),
+        ):
+            self.assertLess(abs(by_name[name]["offset"] - truth), 0.05, name)
+        for name, slope in (
+            ("drift_0_1pct", -0.001),
+            ("drift_0_5pct", -0.005),
+            ("drift_1_0pct", -0.010),
+        ):
+            self.assertLess(abs(by_name[name]["drift"] - slope), 0.006, name)
+            self.assertLess(by_name[name]["errors"]["mae"], 0.02, name)
+        self.assertLess(by_name["nonlinear_drift"]["errors"]["mae"], 0.08)
+        self.assertLess(by_name["leading_silence"]["errors"]["mae"], 0.12)
+        self.assertLess(by_name["trailing_silence"]["errors"]["mae"], 0.12)
+        self.assertLess(by_name["repeated_section"]["errors"]["mae"], 0.35)
+        middle = by_name["middle_discontinuity"]
+        for part, err in middle["section_mae"].items():
+            self.assertLess(err, 0.05, part)
+        false_pos, missed = discontinuity_counts(middle["jumps"], middle["true_jumps"], tol=2.0)
+        self.assertEqual(missed, 0)
+        self.assertLessEqual(false_pos, 2)
 
     def test_profile_override(self) -> None:
         profile = resolve_profile(None, 0, name="edm", win_sec=5.0)

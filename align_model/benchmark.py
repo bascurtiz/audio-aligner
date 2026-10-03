@@ -163,10 +163,14 @@ def case_gaps() -> dict:
     stem = map_vocal_gaps(qry, ref, SR, profile=_profile(ref), target_sec=len(ref) / SR)
     inserts = stem.report.get("gap_inserts") or []
     durations = [float(span[1] - span[0]) for span in inserts]
+    speech = [(float(span.dst_start), float(span.dst_end)) for span in stem.spans if span.kind == "speech"]
+    silence = [(float(span.dst_start), float(span.dst_end)) for span in stem.spans if span.kind == "silence"]
     out = {
         "name": "missing_internal_gaps",
         "inserts": inserts,
         "durations": durations,
+        "speech": speech,
+        "silence": silence,
         "monotonic": _spans_monotonic(stem.spans),
         "errors": {"mae": 0.0, "rmse": 0.0, "p95": 0.0, "max": 0.0},
         "smoothness": 0.0,
@@ -309,6 +313,94 @@ def _step_case(name: str, f0: float, at: float, size: float):
     return run
 
 
+def case_leading_silence() -> dict:
+    body_n = int(6.0 * SR)
+    t = np.arange(body_n) / SR
+    body = np.sin(2 * np.pi * (150.0 * t + 4.0 * t * t)).astype(np.float32)
+    lead = int(0.35 * SR)
+    ref = np.concatenate([np.zeros(lead, dtype=np.float32), body])
+    out = _fit(ref, body, lambda _t: 0.35, max_lag=0.8)
+    out["name"] = "leading_silence"
+    out["true_offset"] = 0.35
+    return out
+
+
+def case_trailing_silence() -> dict:
+    body_n = int(6.0 * SR)
+    t = np.arange(body_n) / SR
+    body = np.sin(2 * np.pi * (165.0 * t + 4.0 * t * t)).astype(np.float32)
+    tail = np.zeros(int(0.40 * SR), dtype=np.float32)
+    ref = np.concatenate([body, tail])
+    out = _fit(ref, body, lambda _t: 0.0, max_lag=0.8)
+    out["name"] = "trailing_silence"
+    out["true_offset"] = 0.0
+    return out
+
+
+def _bursty(dur: float, seed: int = 1) -> np.ndarray:
+    """Chirp plus uneven attacks, so a short shift cannot hide on a click grid."""
+    n = int(dur * SR)
+    t = np.arange(n) / SR
+    y = 0.25 * np.sin(2 * np.pi * (90.0 * t + 1.2 * t * t))
+    rng = np.random.default_rng(seed)
+    click = int(0.02 * SR)
+    env = np.exp(-np.linspace(0.0, 6.0, click))
+    pos = 0.15
+    while pos < dur - 0.2:
+        i = int(pos * SR)
+        y[i : i + click] += 0.9 * env
+        pos += float(rng.uniform(0.29, 0.71))
+    peak = float(np.max(np.abs(y))) or 1.0
+    return (0.7 * y / peak).astype(np.float32)
+
+
+def case_middle_discontinuity() -> dict:
+    """0–30 s aligned, 30–60 s late by 80 ms, 60–90 s aligned again."""
+    dur = 90.0
+    ref = _bursty(dur)
+
+    def delay(tt):
+        tt = np.asarray(tt, dtype=float)
+        return np.where((tt >= 30.0) & (tt < 60.0), 0.08, 0.0)
+
+    qry = apply_lag(ref, SR, delay)
+    stem = map_stem(
+        ref,
+        qry,
+        SR,
+        kind="instrumental",
+        profile=_profile(ref, max_lag=0.5),
+        target_sec=dur,
+        in_sec=dur,
+    )
+
+    def section(a: float, b: float, truth: float) -> float:
+        mask = (stem.times >= a) & (stem.times < b)
+        if not np.any(mask):
+            return 1e9
+        return float(np.mean(np.abs(stem.lags[mask] - truth)))
+
+    jumps = [float(j.get("time", 0.0)) for j in stem.report.get("jumps") or []]
+    errors = lag_errors(stem.times, stem.lags, lambda tt: -float(np.asarray(delay(tt))))
+    out = {
+        "name": "middle_discontinuity",
+        "errors": errors,
+        "jumps": jumps,
+        "smoothness": warp_smoothness(stem.times, stem.lags),
+        "monotonic": bool(len(stem.src) < 2 or np.all(np.diff(stem.src) >= -1e-3)),
+        "offset": float(stem.report.get("offset_sec") or 0.0),
+        "drift": float(stem.report.get("drift") or 0.0),
+        "true_jumps": [30.0, 60.0],
+        "section_mae": {
+            "early": section(5.0, 25.0, 0.0),
+            "middle": section(35.0, 55.0, -0.08),
+            "late": section(65.0, 85.0, 0.0),
+        },
+        "markers": [float(v) for v in stem.dst],
+    }
+    return out
+
+
 CASES = (
     case_perfect,
     case_offset,
@@ -334,6 +426,15 @@ CASES = (
     _step_case("step_100ms", 90.0, 3.0, 0.10),
     _step_case("step_80ms", 120.0, 2.5, 0.08),
     _offset_case("offset_30ms", 300.0, 0.03),
+    _offset_case("offset_m50ms", 185.0, -0.05),
+    _chirp_offset("offset_p200ms", 0.20),
+    _chirp_offset("offset_m200ms", -0.20),
+    _drift_case("drift_0_1pct", 188.0, 0.001),
+    _drift_case("drift_0_5pct", 205.0, 0.005),
+    _drift_case("drift_1_0pct", 172.0, 0.010),
+    case_leading_silence,
+    case_trailing_silence,
+    case_middle_discontinuity,
 )
 
 

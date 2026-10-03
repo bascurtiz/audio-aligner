@@ -1,4 +1,10 @@
-"""Certainty map, constrained DTW, and curvature-adaptive warp markers."""
+"""Certainty map, constrained lag path, and curvature-adaptive warp markers.
+
+Source coordinates are times in the original stem. Destination coordinates
+are times in the reference. ``pad_sec`` is pre-roll before source time 0
+and is not part of the source coordinate. The renderer adds it when it
+opens the padded wav.
+"""
 
 from __future__ import annotations
 
@@ -112,7 +118,9 @@ def solve_constrained_lag_path(
 ) -> np.ndarray:
     """Monotonic lag path inside a confidence-sized band around the robust line.
 
-    A jump is allowed only when the margin is high and the step is large.
+    A jump of at least 40 ms is allowed when the point being entered, or the
+    confident point it leaves, has a high margin. The step can sit between
+    two windows, so it does not have to be proven by the destination alone.
     Ambiguous points are pulled onto the beat-snapped line.
     """
     t = np.asarray(times, dtype=float).reshape(-1)
@@ -209,7 +217,9 @@ def solve_constrained_lag_path(
         mono = dlag <= dt - 1e-3
         smooth = np.abs(dlag) <= max_dlag + 1e-9
         trans = np.where(mono & smooth, 0.0, inf)
-        if float(margin[i]) >= HIGH_MARGIN:
+        entered = float(margin[i]) >= high_margin_min
+        left = float(margin[i - 1]) >= high_margin_min and float(conf[i - 1]) >= high_conf
+        if entered or left:
             jump = mono & (np.abs(dlag) >= 0.04) & ~smooth
             trans = np.where(jump, 0.5 * np.abs(dlag) / scale, trans)
         costs = data_cost_row(i, grid, pull[i], conf[i], beat_w[i], scale)
@@ -348,7 +358,13 @@ def src_dst_from_lags(
     jump_times: list[float] | None = None,
     scores: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """src = dst - lag, monotonic, with the 2% rate-step clamp."""
+    """Positions on the padded wav: src = dst - residual lag.
+
+    The residual is the full lag with the constant offset removed. Adding
+    that offset as front padding puts these coordinates on the file the
+    renderer opens. ``map_stem`` subtracts the pad before storing ``src``,
+    so stored source times are original-stem times.
+    """
     t = np.asarray(times, dtype=float).reshape(-1)
     lag = np.asarray(lags, dtype=float).reshape(-1)
     target_sec = max(0.0, float(target_sec))
@@ -392,6 +408,17 @@ def src_dst_from_lags(
     return src[keep], dst[keep]
 
 
+def source_on_padded_wav(src: np.ndarray, pad_sec: float) -> np.ndarray:
+    """Original-stem source times to positions in the padded wav.
+
+    ``pad_sec`` is pre-roll before source time 0. A negative value trims
+    the front of the stem, so the same addition still addresses the file
+    the renderer opens. Callers that already hold padded-wav coordinates
+    must not call this.
+    """
+    return np.asarray(src, dtype=float) + float(pad_sec)
+
+
 def solve_time_map(
     evidence: AlignmentEvidence,
     report: AlignmentReport,
@@ -403,10 +430,11 @@ def solve_time_map(
     in_sec: float,
     beat_weight: float | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Return times, mapped lags (full, including offset), src, dst.
+    """Return times, mapped lags (full, including offset), padded src, dst.
 
-    Warp callers subtract ``report.offset_sec`` and pass that residual with a
-    front pad. The returned lags are the ones to draw.
+    ``src`` here is still a padded-wav position (dst minus the residual).
+    ``map_stem`` subtracts ``pad_sec`` so the stored map is in original-stem
+    time. The returned lags are the ones to draw.
     """
     times = evidence.times
     if len(times) < 2:

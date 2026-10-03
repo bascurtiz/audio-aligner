@@ -766,6 +766,11 @@ def write_warped_stem(
     elif n < 0:
         y = y[min(-n, len(y)) :]
 
+    if src_dst is not None:
+        from align_model.time_map import source_on_padded_wav
+
+        src_dst = (source_on_padded_wav(src_dst[0], pad_sec), src_dst[1])
+
     if src_dst is not None or (len(times) >= 2 and len(lags) >= 2):
         y = rubberband_timemap_stretch(
             y,

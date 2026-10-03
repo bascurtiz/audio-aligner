@@ -17,6 +17,14 @@ from align_model.time_map import solve_time_map
 
 @dataclass
 class StemMap:
+    """Solved map for one stem.
+
+    ``src`` is an original-stem time. Time 0 is the first sample of the
+    file before padding. ``dst`` is a reference time. ``pad_sec`` is
+    pre-roll in front of source time 0 (negative trims the front). The
+    renderer reads the padded wav at ``src + pad_sec``.
+    """
+
     times: np.ndarray
     lags: np.ndarray
     scores: np.ndarray
@@ -92,7 +100,9 @@ def map_stem(
         in_sec=source_sec,
     )
     pad = float(np.clip(measured.offset_sec, -profile.max_pad_sec, profile.max_pad_sec))
-    # Markers were built on the residual (mapped - offset). The pad carries the offset.
+    # The solver's src is a position in the padded wav. Store the original
+    # stem time. Renderers add pad back when they address that wav.
+    src = np.asarray(src, dtype=float) - pad
     report = apply_codes(measured, margins=evidence.margins)
     report["kind"] = kind
     return StemMap(
@@ -195,8 +205,10 @@ def _model_phrase(
     spans: list[MapSpan] = []
     shift = float(stem.pad_sec)
     for src, dst, nxt_src, nxt_dst in zip(stem.src[:-1], stem.dst[:-1], stem.src[1:], stem.dst[1:]):
-        src0 = float(unit.src_start) + float(src)
-        src1 = float(unit.src_start) + float(nxt_src)
+        # src is an original-phrase time. The phrase audio is not padded, so
+        # the read position is the padded-wav coordinate src + shift.
+        src0 = float(unit.src_start) + float(src) + shift
+        src1 = float(unit.src_start) + float(nxt_src) + shift
         dst0 = origin + shift + float(dst)
         dst1 = origin + shift + float(nxt_dst)
         if src1 - src0 < 0.03 or dst1 - dst0 < 0.03:
