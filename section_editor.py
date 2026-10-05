@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """Drag acapella or instrumental sections, then write that layout.
 
-Top lane is the Demucs vocal from the original (fixed).
+Top lane is the Mel-Band vocal from the original (fixed).
 Bottom lane is the processed stem, split into sections.
 Drag a section sideways to move it on the song timeline.
 Apply writes that layout, then re-processes that stem: élastique
-against its Demucs split and loudness match. The other stem is left
+against its Mel-Band split and loudness match. The other stem is left
 as it is. Gap placement is not run again. The first apply keeps a copy
 in _before_section_edit.
 """
@@ -821,25 +821,70 @@ class _Loader(QThread):
             self.failed.emit(f"{type(exc).__name__}: {exc}")
 
 
-def _audible_end_sec(y: np.ndarray, sr: int, thr: float = 0.008) -> float:
-    """Last moment the waveform is still audible, plus a short release.
+def _contiguous_tail_sec(y: np.ndarray, sr: int) -> float:
+    """How long the decay at the start of ``y`` stays audible, plus a short release.
 
-    Phrase detection stops on a bandpass dip. The vocal after that dip is
-    still in the file, and the editor only draws inside a section, so the
-    tail looked cut off.
+    The release has to be contiguous. The last loud window in the gap can be
+    the next phrase, and an RMS floor of 0.008 drops a taper that is still
+    visible on the lane.
     """
-    mono = y.mean(axis=1) if y.ndim == 2 else y
+    mono = y.mean(axis=1) if y.ndim == 2 else np.asarray(y)
     win = max(1, int(0.05 * sr))
     n = len(mono) // win
     if n < 1:
         return 0.0
-    sl = mono[: n * win].reshape(n, win)
-    rms = np.sqrt(np.mean(sl * sl, axis=1))
-    idx = np.flatnonzero(rms >= thr)
-    if len(idx) == 0:
+    block = mono[: n * win].reshape(n, win)
+    rms = np.sqrt(np.mean(block * block, axis=1))
+    peak = np.max(np.abs(block), axis=1)
+    loud = (rms >= 0.002) | (peak >= 0.012)
+    if not bool(loud[0]):
         return 0.0
-    last = (int(idx[-1]) + 1) * win / sr
-    return min(len(mono) / sr, last + 0.12)
+    last = 0
+    quiet = 0
+    quiet_limit = max(1, int(round(0.20 * sr / win)))
+    for i, flag in enumerate(loud):
+        if flag:
+            last = i
+            quiet = 0
+            continue
+        quiet += 1
+        if quiet >= quiet_limit:
+            break
+    end = (last + 1) * win / sr + 0.12
+    return min(len(mono) / sr, end)
+
+
+def _extend_section_tails(
+    sections: list[Section],
+    audio: np.ndarray,
+    sr: int,
+    duration: float,
+) -> list[Section]:
+    """Pull each section's end through the decay the silence gate dropped.
+
+    Detection ends on the first quiet hop. The tail is still in the file, in
+    the gap before the next phrase. The editor draws and pastes only
+    ``[src0, src1]``, so that tail was cut on every section but the last.
+    """
+    if not sections or sr <= 0:
+        return sections
+    n_audio = len(audio)
+    out: list[Section] = []
+    for i, sec in enumerate(sections):
+        nxt = sections[i + 1].src0 if i + 1 < len(sections) else float(duration)
+        limit = min(float(duration), max(float(sec.src1), float(nxt)))
+        if limit <= sec.src1 + 0.02:
+            out.append(sec)
+            continue
+        i0 = max(0, min(n_audio, int(round(sec.src1 * sr))))
+        i1 = max(i0, min(n_audio, int(round(limit * sr))))
+        heard = _contiguous_tail_sec(audio[i0:i1], sr) if i1 > i0 else 0.0
+        new_end = min(limit, float(sec.src1) + heard)
+        if new_end > sec.src1 + 0.02:
+            out.append(Section(sec.src0, new_end, sec.dst0))
+        else:
+            out.append(sec)
+    return out
 
 
 def _clock_marks(duration: float, spacing: float = 30.0) -> list[float]:
@@ -963,11 +1008,7 @@ def _load_song(folder: Path) -> dict:
     if not segs:
         segs = [(0.0, duration)]
     sections = [Section(a, b, a) for a, b in segs if b - a >= 0.15]
-    if sections:
-        heard = _audible_end_sec(aca, sr)
-        tail = sections[-1]
-        if heard > tail.src1 + 0.02:
-            sections[-1] = Section(tail.src0, min(heard, duration), tail.dst0)
+    sections = _extend_section_tails(sections, aca, sr, duration)
 
     inst_sections: list[Section] = []
     inst_v = None
@@ -985,11 +1026,7 @@ def _load_song(folder: Path) -> dict:
         if not inst_segs:
             inst_segs = [(0.0, duration)]
         inst_sections = [Section(a, b, a) for a, b in inst_segs if b - a >= 0.15]
-        if inst_sections:
-            heard = _audible_end_sec(inst, sr)
-            tail = inst_sections[-1]
-            if heard > tail.src1 + 0.02:
-                inst_sections[-1] = Section(tail.src0, min(heard, duration), tail.dst0)
+        inst_sections = _extend_section_tails(inst_sections, inst, sr, duration)
 
     bar_times, cue_on_bars = _warp_cue_times(orig_path, duration)
     aca_markers = _step_marker_times(vox, aca, sr, bar_times)
@@ -1021,7 +1058,7 @@ def _load_song(folder: Path) -> dict:
 
 
 class Timeline(QWidget):
-    """Demucs vocal on top, draggable acapella sections below."""
+    """Mel-Band vocal on top, draggable acapella sections below."""
 
     changed = pyqtSignal()
     seeked = pyqtSignal(float)
@@ -1065,10 +1102,11 @@ class Timeline(QWidget):
         self.marker_times: list[float] = []
         self._aca_markers: list[float] = []
         self._inst_markers: list[float] = []
+        self.drift_span: tuple[float, float] | None = None
         self.solo = {"demucs": False, "output": False}
         self.mute = {"demucs": False, "output": False}
-        self._demucs_solo = self._make_sm("S", "Solo Demucs vocal (1)")
-        self._demucs_mute = self._make_sm("M", "Mute Demucs vocal (Shift+1)", danger=True)
+        self._demucs_solo = self._make_sm("S", "Solo Mel-Band vocal (1)")
+        self._demucs_mute = self._make_sm("M", "Mute Mel-Band vocal (Shift+1)", danger=True)
         self._output_solo = self._make_sm("S", "Solo output acapella (2)")
         self._output_mute = self._make_sm("M", "Mute output acapella (Shift+2)", danger=True)
         self._demucs_solo.clicked.connect(lambda: self.toggle_solo("demucs"))
@@ -1115,16 +1153,16 @@ class Timeline(QWidget):
         if self.stem == "inst":
             self.vox_peaks = self._inst_ref_peaks
             self.aca_peaks = self._inst_out_peaks
-            self._demucs_solo.setToolTip("Solo Demucs instrumental (1)")
-            self._demucs_mute.setToolTip("Mute Demucs instrumental (Shift+1)")
+            self._demucs_solo.setToolTip("Solo Mel-Band instrumental (1)")
+            self._demucs_mute.setToolTip("Mute Mel-Band instrumental (Shift+1)")
             self._output_solo.setToolTip("Solo instrumental output (2)")
             self._output_mute.setToolTip("Mute instrumental output (Shift+2)")
             self.marker_times = self._inst_markers
         else:
             self.vox_peaks = self._aca_ref_peaks
             self.aca_peaks = self._aca_out_peaks
-            self._demucs_solo.setToolTip("Solo Demucs vocal (1)")
-            self._demucs_mute.setToolTip("Mute Demucs vocal (Shift+1)")
+            self._demucs_solo.setToolTip("Solo Mel-Band vocal (1)")
+            self._demucs_mute.setToolTip("Mute Mel-Band vocal (Shift+1)")
             self._output_solo.setToolTip("Solo output acapella (2)")
             self._output_mute.setToolTip("Mute output acapella (Shift+2)")
             self.marker_times = self._aca_markers
@@ -1479,6 +1517,7 @@ class Timeline(QWidget):
             self._draw_alignment(p, ruler, h)
         self._draw_ruler(p, ruler)
         self._draw_warp_cues(p, ruler, h)
+        self._draw_drift_span(p, ruler, h)
         if self._hover_x is not None:
             hx = int(round(self._hover_x))
             if GUTTER <= hx <= w:
@@ -1491,14 +1530,44 @@ class Timeline(QWidget):
                 p.drawLine(x, ruler, x, h)
         p.setPen(QColor(DIM))
         p.setFont(QFont("Segoe UI", 8))
-        if self.stem == "inst":
-            ref_name = "Demucs instrumental"
+        if self.vox_peaks is None and self.aca_peaks is None:
+            ref_name = "Loading..."
+            out_name = "Loading..."
         else:
-            ref_name = "Demucs vocal"
-        out_name = "Output — drag a section" if self.editing() else "Instrumental output"
+            if self.stem == "inst":
+                ref_name = "Mel-Band instrumental"
+            else:
+                ref_name = "Mel-Band vocal"
+            out_name = "Output — drag a section" if self.editing() else "Instrumental output"
         p.drawText(GUTTER + 8, ruler + 14, ref_name)
         p.drawText(GUTTER + 8, aca_top + 14, out_name)
         p.end()
+
+    def _draw_drift_span(self, p: QPainter, ruler_h: int, bottom: int) -> None:
+        """Dashed drift line over the failing window, same style as the lag map."""
+        span = self.drift_span
+        if span is None:
+            return
+        t0, t1 = float(span[0]), float(span[1])
+        if t1 <= t0:
+            return
+        x0 = int(round(self._t_to_x(t0)))
+        x1 = int(round(self._t_to_x(t1)))
+        left = max(GUTTER, min(x0, x1))
+        right = min(self.width(), max(x0, x1))
+        if right - left < 2:
+            return
+        drift = QColor("#ecc990")
+        band = QColor(drift)
+        band.setAlpha(28)
+        p.fillRect(left, ruler_h, right - left, max(1, bottom - ruler_h), band)
+        pen = QPen(drift, 1.2, Qt.PenStyle.DashLine)
+        p.setPen(pen)
+        mid = ruler_h + (bottom - ruler_h) // 2
+        p.drawLine(left, mid, right, mid)
+        p.setPen(QPen(drift, 1.2))
+        p.drawLine(left, mid - 5, left, mid + 5)
+        p.drawLine(right, mid - 5, right, mid + 5)
 
     def _alignment_step(self) -> float:
         """Seconds between lines. Zooming in brings the lines closer, down to 0.1 s."""
@@ -1732,6 +1801,7 @@ class SectionEditor(QWidget):
         on_apply_scored=None,
         on_apply_end=None,
         tag_folders=None,
+        stem_notes: dict[str, str] | None = None,
     ) -> None:
         super().__init__(None, Qt.WindowType.Window | Qt.WindowType.FramelessWindowHint)
         self.folder = folder
@@ -1741,6 +1811,11 @@ class SectionEditor(QWidget):
         self._on_apply_scored = on_apply_scored
         self._on_apply_end = on_apply_end
         self._tag_folders_enabled = tag_folders
+        notes = stem_notes if isinstance(stem_notes, dict) else {}
+        self._stem_notes = {
+            "aca": str(notes.get("aca") or "").strip(),
+            "inst": str(notes.get("inst") or "").strip(),
+        }
         self.setObjectName("AppRoot")
         self.setWindowTitle("Audio Aligner - Editor")
         self.resize(WIN_DEFAULT_W, WIN_DEFAULT_H)
@@ -1817,22 +1892,23 @@ class SectionEditor(QWidget):
         self._stem_group.addButton(self.aca_radio, 0)
         self._stem_group.addButton(self.inst_radio, 1)
         self.aca_radio.setToolTip(
-            "Shows the Demucs vocal and the acapella.\n"
+            "Shows the Mel-Band vocal and the acapella.\n"
             "Apply writes this stem."
         )
         self.inst_radio.setToolTip(
-            "Shows the Demucs instrumental and its output.\n"
+            "Shows the Mel-Band instrumental and its output.\n"
             "Apply writes this stem."
         )
         self._stem_group.idClicked.connect(self._on_stem_changed)
-        self.status = QLabel("Loading Demucs vocal and acapella…")
+        self.status = QLabel("Loading Mel-Band vocal and acapella…")
         self.status.setObjectName("StatusLabel")
         self.status.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.status.setWordWrap(True)
         self.status.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
-        self.with_demucs = QCheckBox("Play against Demucs vocal")
+        self.with_demucs = QCheckBox("Play against Mel-Band vocal")
         self.with_demucs.setChecked(True)
         self.with_demucs.setToolTip(
-            "On plays the acapella against the Demucs vocal.\n"
+            "On plays the acapella against the Mel-Band vocal.\n"
             "Off plays the acapella with the instrumental."
         )
         self.with_demucs.toggled.connect(lambda _checked: self._sync_gains())
@@ -1844,7 +1920,6 @@ class SectionEditor(QWidget):
         self.align_lines.toggled.connect(self._toggle_alignment)
         self.bar_lines = QCheckBox("Warp markers")
         self.bar_lines.setChecked(True)
-        self.bar_lines.setStyleSheet(f"QCheckBox {{ color: {STRETCH_CUE}; background: transparent; }}")
         self.bar_lines.setToolTip(
             "Shows a marker where the lag has stepped.\n"
             "Faint ticks on the ruler are every 8 bars.\n"
@@ -2111,7 +2186,7 @@ class SectionEditor(QWidget):
         self.timeline.update()
         self._sync_edit_buttons()
         word = "sections" if len(nxt) != 1 else "section"
-        self.status.setText(f"{len(nxt)} {word}.")
+        self._show_idle_status(extra=f"{len(nxt)} {word}.")
 
     def _restore_sections(self, snap: tuple) -> None:
         self.timeline.sections = [section_from_snap(item) for item in snap]
@@ -2170,12 +2245,45 @@ class SectionEditor(QWidget):
         self._sync_scroll()
         self._sync_transport()
         self._sync_edit_buttons()
-        n = len(data["sections"])
-        self.status.setText(
-            f"{n} sections. Drag them onto the Demucs vocal."
-        )
+        self._show_idle_status()
         if not HAS_MEDIA:
             self.status.setText(self.status.text() + " Playback needs sounddevice.")
+
+    def _stem_note(self, stem: str | None = None) -> str:
+        key = stem or self.timeline.stem
+        return str(self._stem_notes.get(key) or "").strip()
+
+    def _sync_drift_span(self) -> None:
+        from check_alignment import parse_drift_span
+
+        span = parse_drift_span(self._stem_note())
+        self.timeline.drift_span = span
+        self.timeline.update()
+
+    def _idle_status_text(self, *, count: int | None = None, stem: str | None = None) -> str:
+        key = stem or self.timeline.stem
+        note = self._stem_note(key)
+        if note:
+            return note
+        n = len(self.timeline.sections) if count is None else int(count)
+        word = "sections" if n != 1 else "section"
+        target = "Mel-Band instrumental" if key == "inst" else "Mel-Band vocal"
+        return f"{n} {word}. Drag them onto the {target}."
+
+    def _show_idle_status(self, *, extra: str | None = None) -> None:
+        note = self._stem_note()
+        if note and not extra:
+            text = note
+        elif extra and note:
+            text = note
+        elif extra:
+            text = extra
+        else:
+            text = self._idle_status_text()
+        self.status.setText(text)
+        tip = note or "Drag sections against the Mel-Band reference."
+        self.status.setToolTip(tip)
+        self._sync_drift_span()
 
     def _on_failed(self, message: str) -> None:
         self._set_busy(False)
@@ -2246,17 +2354,13 @@ class SectionEditor(QWidget):
             self._ensure_aca_play()
         self._sync_gains()
         self._sync_edit_buttons()
-        n = len(self.timeline.sections)
-        if stem == "inst":
-            self.status.setText(f"{n} sections. Drag them onto the Demucs instrumental.")
-        else:
-            self.status.setText(f"{n} sections. Drag them onto the Demucs vocal.")
+        self._show_idle_status()
 
     def _apply_pair_chrome(self) -> None:
         if self.timeline.stem == "inst":
-            self.with_demucs.setText("Play against Demucs instrumental")
+            self.with_demucs.setText("Play against Mel-Band instrumental")
             self.with_demucs.setToolTip(
-                "On plays the instrumental against the Demucs instrumental.\n"
+                "On plays the instrumental against the Mel-Band instrumental.\n"
                 "Off plays the instrumental with the acapella."
             )
             self.align_lines.setToolTip(
@@ -2268,9 +2372,9 @@ class SectionEditor(QWidget):
                 "The acapella is not changed."
             )
             return
-        self.with_demucs.setText("Play against Demucs vocal")
+        self.with_demucs.setText("Play against Mel-Band vocal")
         self.with_demucs.setToolTip(
-            "On plays the acapella against the Demucs vocal.\n"
+            "On plays the acapella against the Mel-Band vocal.\n"
             "Off plays the acapella with the instrumental."
         )
         self.align_lines.setToolTip(
@@ -2440,6 +2544,8 @@ class SectionEditor(QWidget):
         self._invalidate_aca_play()
         if self._is_playing() and self._data is not None:
             self._ensure_aca_play()
+        if self.timeline._drag is None and self.timeline._stretch is None:
+            self._show_idle_status()
 
     def _on_audio_tick(self) -> None:
         if self._data is None or self._play.is_held():
@@ -2575,12 +2681,13 @@ class SectionEditor(QWidget):
         if self._data is None or self._busy or not self._sections_dirty() or not self.timeline.editing():
             return
         stem = self.timeline.stem
+        ref = "Mel-Band"
         if stem == "inst":
             dest: Path | None = self._data.get("inst_path")
             audio = self._data.get("inst")
             prompt = (
                 "Write these section positions, then re-align that instrumental "
-                "with élastique against the Demucs instrumental, match its loudness, "
+                f"with élastique against the {ref} instrumental, match its loudness, "
                 "and score it again. The acapella is left as it is.\n\n"
             )
         else:
@@ -2588,7 +2695,7 @@ class SectionEditor(QWidget):
             audio = self._data.get("aca")
             prompt = (
                 "Write these section positions, then re-align that acapella "
-                "with élastique against the Demucs vocal, match its loudness, "
+                f"with élastique against the {ref} vocal, match its loudness, "
                 "and score it again. The instrumental is left as it is.\n\n"
             )
         if dest is None or audio is None:
@@ -2790,6 +2897,7 @@ def open_section_editor(
     on_apply_scored=None,
     on_apply_end=None,
     tag_folders=None,
+    stem_notes: dict[str, str] | None = None,
 ) -> SectionEditor:
     # Stay a top-level window. Parenting onto the aligner creates a native
     # child that can take down the host when the frameless frame is shown.
@@ -2802,6 +2910,7 @@ def open_section_editor(
         on_apply_scored=on_apply_scored,
         on_apply_end=on_apply_end,
         tag_folders=tag_folders,
+        stem_notes=stem_notes,
     )
     win.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
     win.setAttribute(Qt.WidgetAttribute.WA_QuitOnClose, False)

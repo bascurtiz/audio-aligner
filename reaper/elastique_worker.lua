@@ -348,16 +348,7 @@ local function process_job(job)
 end
 
 ----------------------------------------------------------------
-local json_path = os.getenv("ALIGN_CHECKER_REAPER_JOB") or ""
-if json_path == "" then
-  local src = debug.getinfo(1, "S").source
-  if src:sub(1, 1) == "@" then src = src:sub(2) end
-  local dir = src:match("^(.*)[/\\]") or "."
-  json_path = dir .. "/reaper_job.json"
-end
-
-local ok, err = pcall(function()
-  console("align-checker elastique worker")
+local function run_batch(json_path)
   console("job: " .. json_path)
   local f = io.open(json_path, "rb")
   if not f then error("cannot open job file") end
@@ -369,13 +360,88 @@ local ok, err = pcall(function()
     console(string.format("job %d/%d", i, #jobs))
     process_job(job)
   end
-end)
-
-if ok then
-  write_text(json_path .. ".done", "ok\n")
-else
-  console("ERROR: " .. tostring(err))
-  write_text(json_path .. ".error", tostring(err) .. "\n")
 end
 
-reaper.Main_OnCommand(40004, 0) -- close project
+local function oneshot()
+  local json_path = os.getenv("ALIGN_CHECKER_REAPER_JOB") or ""
+  if json_path == "" then
+    local src = debug.getinfo(1, "S").source
+    if src:sub(1, 1) == "@" then src = src:sub(2) end
+    local dir = src:match("^(.*)[/\\]") or "."
+    json_path = dir .. "/reaper_job.json"
+  end
+
+  console("align-checker elastique worker (oneshot)")
+  local ok, err = pcall(function()
+    run_batch(json_path)
+  end)
+
+  if ok then
+    write_text(json_path .. ".done", "ok\n")
+  else
+    console("ERROR: " .. tostring(err))
+    write_text(json_path .. ".error", tostring(err) .. "\n")
+  end
+
+  reaper.Main_OnCommand(40004, 0) -- close project
+end
+
+local function join_inbox(inbox, name)
+  inbox = inbox:gsub("[/\\]+$", "")
+  if inbox:find("\\") then
+    return inbox .. "\\" .. name
+  end
+  return inbox .. "/" .. name
+end
+
+local function daemon()
+  local inbox = os.getenv("ALIGN_CHECKER_REAPER_INBOX") or ""
+  local job_path = join_inbox(inbox, "job.json")
+  local busy_path = join_inbox(inbox, "job.busy")
+  local quit_path = join_inbox(inbox, "quit")
+  local ready_path = join_inbox(inbox, "ready")
+
+  console("align-checker elastique worker (warm)")
+  console("inbox: " .. inbox)
+  write_text(ready_path, "ok\n")
+
+  local function poll()
+    if file_exists(quit_path) then
+      os.remove(quit_path)
+      console("warm worker quit")
+      reaper.Main_OnCommand(40001, 0) -- File: Quit REAPER
+      return
+    end
+
+    local done_path = job_path .. ".done"
+    local err_path = job_path .. ".error"
+    if file_exists(job_path)
+      and not file_exists(done_path)
+      and not file_exists(err_path)
+      and not file_exists(busy_path)
+    then
+      write_text(busy_path, "1\n")
+      local ok, err = pcall(function()
+        run_batch(job_path)
+      end)
+      if ok then
+        write_text(done_path, "ok\n")
+      else
+        console("ERROR: " .. tostring(err))
+        write_text(err_path, tostring(err) .. "\n")
+      end
+      os.remove(busy_path)
+      wipe_project()
+    end
+
+    reaper.defer(poll)
+  end
+
+  reaper.defer(poll)
+end
+
+if (os.getenv("ALIGN_CHECKER_REAPER_INBOX") or "") ~= "" then
+  daemon()
+else
+  oneshot()
+end

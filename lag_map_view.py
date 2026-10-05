@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-from PyQt6.QtCore import QPointF, Qt
+from PyQt6.QtCore import QPointF, Qt, pyqtSignal
 from PyQt6.QtGui import QColor, QFont, QPainter, QPen
-from PyQt6.QtWidgets import QLabel, QVBoxLayout, QWidget
+from PyQt6.QtWidgets import QLabel, QSizePolicy, QToolButton, QVBoxLayout, QWidget
 
 _BG = "#15161c"
 _FG = "#e6e8ef"
@@ -54,20 +54,20 @@ class LagMapView(QWidget):
         font.setPixelSize(11)
         painter.setFont(font)
         metrics = painter.fontMetrics()
-        hi_label, lo_label, t0, t1, lo, hi, offset, slope, inst, inst_lags = self._scales(
+        _hi_label, _lo_label, t0, t1, lo, hi, offset, slope, inst, inst_lags = self._scales(
             times, lags, report
         )
-        gutter = max(metrics.horizontalAdvance(hi_label), metrics.horizontalAdvance(lo_label)) + 10
-        legend_h = self._legend_height(painter, rect.width(), gutter)
-        right = 10
+        legend_w = self._legend_width(painter)
+        left = 8
+        right = legend_w + 14
         marker_hang = 10
         bottom = marker_hang + metrics.height() + 4
-        top = legend_h + 4
-        left = gutter
+        top = 6
         plot = rect.adjusted(left, top, -right, -bottom)
         if plot.width() < 20 or plot.height() < 20:
             painter.end()
             return
+
         def x_of(t: float) -> float:
             return plot.left() + (t - t0) / (t1 - t0) * plot.width()
 
@@ -128,8 +128,6 @@ class LagMapView(QWidget):
 
         painter.setPen(QColor(_DIM))
         painter.setFont(font)
-        self._draw_axis_label(painter, hi_label, left - 6, plot.top() + metrics.ascent())
-        self._draw_axis_label(painter, lo_label, left - 6, plot.bottom())
         clock_y = rect.bottom() - 3
         start = _clock(t0)
         end = _clock(t1)
@@ -140,7 +138,7 @@ class LagMapView(QWidget):
         if end_x < plot.left() + start_w + 12:
             end_x = plot.left() + start_w + 12
         painter.drawText(int(end_x), clock_y, end)
-        self._draw_legend(painter, rect.width(), left)
+        self._draw_legend(painter, plot.right() + 10, plot.top())
         painter.end()
 
     @staticmethod
@@ -176,15 +174,8 @@ class LagMapView(QWidget):
         return f"{hi * 1000:.0f}", f"{lo * 1000:.0f}", t0, t1, lo, hi, offset, slope, inst, inst_lags
 
     @staticmethod
-    def _draw_axis_label(painter: QPainter, text: str, right: int, baseline: int) -> None:
-        width = painter.fontMetrics().horizontalAdvance(text)
-        painter.drawText(int(right - width), int(baseline), text)
-
-    def _legend_height(self, painter: QPainter, width: int, origin: int) -> int:
-        return 4 + len(self._legend_rows(painter, width, origin)) * 16
-
-    def _legend_rows(self, painter: QPainter, width: int, origin: int = 8) -> list[list[tuple[str, str, str]]]:
-        items = [
+    def _legend_items() -> list[tuple[str, str, str]]:
+        return [
             ("vocal", "line", _ACCENT),
             ("inst", "line", _INST),
             ("drift", "dash", _LINE),
@@ -193,30 +184,20 @@ class LagMapView(QWidget):
             ("gap", "band", _GAP),
             ("beat", "tick", _BEAT),
         ]
-        rows: list[list[tuple[str, str, str]]] = [[]]
-        x = origin
-        limit = max(origin + 40, width - 8)
-        metrics = painter.fontMetrics()
-        for item in items:
-            need = 16 + metrics.horizontalAdvance(item[0]) + 14
-            if rows[-1] and x + need > limit:
-                rows.append([])
-                x = origin
-            rows[-1].append(item)
-            x += need
-        return rows
 
-    def _draw_legend(self, painter: QPainter, width: int, origin: int = 8) -> None:
-        rows = self._legend_rows(painter, width, origin)
+    def _legend_width(self, painter: QPainter) -> int:
         metrics = painter.fontMetrics()
-        for r, row in enumerate(rows):
-            x = origin
-            y = 3 + r * 16
-            for label, shape, color in row:
-                self._swatch(painter, x, y + 3, shape, QColor(color))
-                painter.setPen(QColor(color if shape != "band" else "#8eb4d4"))
-                painter.drawText(x + 16, y + 12, label)
-                x += 16 + metrics.horizontalAdvance(label) + 14
+        widest = max(metrics.horizontalAdvance(label) for label, _shape, _color in self._legend_items())
+        return 16 + widest
+
+    def _draw_legend(self, painter: QPainter, x: int, y: int) -> None:
+        metrics = painter.fontMetrics()
+        row_h = max(16, metrics.height() + 4)
+        for i, (label, shape, color) in enumerate(self._legend_items()):
+            top = y + i * row_h
+            self._swatch(painter, x, top + 3, shape, QColor(color))
+            painter.setPen(QColor(color if shape != "band" else "#8eb4d4"))
+            painter.drawText(x + 16, top + metrics.ascent(), label)
 
     @staticmethod
     def _swatch(painter: QPainter, x: int, y: int, shape: str, color: QColor) -> None:
@@ -269,17 +250,81 @@ def metrics_text(report: dict | None) -> str:
 
 
 class LagMapPanel(QWidget):
+    """Collapsible lag map. The chevron hides the plot so the table can grow."""
+
+    expandedChanged = pyqtSignal(bool)
+
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(0, 8, 0, 0)
+        layout.setContentsMargins(0, 4, 0, 0)
         layout.setSpacing(4)
+
+        self._toggle = QToolButton()
+        self._toggle.setObjectName("LagMapToggle")
+        self._toggle.setCheckable(True)
+        self._toggle.setChecked(True)
+        self._toggle.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        self._toggle.setArrowType(Qt.ArrowType.DownArrow)
+        self._toggle.setText("Lag map")
+        self._toggle.setAutoRaise(True)
+        self._toggle.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._toggle.setToolTip("Show or hide the lag map for the selected row.")
+        self._toggle.setStyleSheet(
+            "QToolButton#LagMapToggle {"
+            "  color: #9aa0b4;"
+            "  font-family: 'Segoe UI';"
+            "  font-size: 11px;"
+            "  font-weight: 600;"
+            "  letter-spacing: 0.3px;"
+            "  padding: 2px 4px;"
+            "  border: none;"
+            "  background: transparent;"
+            "}"
+            "QToolButton#LagMapToggle:hover { color: #e6e8ef; }"
+        )
+        self._toggle.toggled.connect(self._on_toggled)
+        layout.addWidget(self._toggle, 0, Qt.AlignmentFlag.AlignLeft)
+
+        self._body = QWidget()
+        body_layout = QVBoxLayout(self._body)
+        body_layout.setContentsMargins(0, 0, 0, 0)
+        body_layout.setSpacing(4)
         self.view = LagMapView()
         self.metrics = QLabel(metrics_text(None))
         self.metrics.setWordWrap(True)
         self.metrics.setStyleSheet("color: #9aa0b4; font-family: 'Segoe UI'; font-size: 12px;")
-        layout.addWidget(self.view, stretch=1)
-        layout.addWidget(self.metrics)
+        body_layout.addWidget(self.view, stretch=1)
+        body_layout.addWidget(self.metrics)
+        layout.addWidget(self._body, stretch=1)
+
+    def is_expanded(self) -> bool:
+        return self._toggle.isChecked()
+
+    def set_expanded(self, expanded: bool) -> None:
+        if self._toggle.isChecked() == bool(expanded):
+            self._apply_expanded(bool(expanded))
+            return
+        self._toggle.setChecked(bool(expanded))
+
+    def _on_toggled(self, expanded: bool) -> None:
+        self._apply_expanded(bool(expanded))
+        self.expandedChanged.emit(bool(expanded))
+
+    def _apply_expanded(self, expanded: bool) -> None:
+        self._toggle.setArrowType(Qt.ArrowType.DownArrow if expanded else Qt.ArrowType.RightArrow)
+        self._body.setVisible(expanded)
+        if expanded:
+            self.setMinimumHeight(0)
+            self.setMaximumHeight(16777215)
+            self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+            self.view.setMinimumHeight(168)
+        else:
+            self.view.setMinimumHeight(0)
+            header = max(22, self._toggle.sizeHint().height() + 8)
+            self.setMinimumHeight(header)
+            self.setMaximumHeight(header)
+            self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
 
     def set_report(self, report: dict | None) -> None:
         self.view.set_report(report)

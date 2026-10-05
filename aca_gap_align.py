@@ -224,8 +224,16 @@ def waveform_ncc_offset(
     lv = lags[valid]
     csum = np.concatenate([[0.0], np.cumsum(ref * ref)])
     energies = csum[lv + m] - csum[lv]
-    denom = np.sqrt(np.maximum(energies, 1e-18)) * q_norm
-    ncc = corr[lv + m - 1] / denom
+    # A running sum of a long file cannot see a silent window. The leftover
+    # correlation is numerical dust, and dividing by that floor invented
+    # scores above 1 that outranked the real phrase.
+    floor = max(1e-6, (q_norm * q_norm) * 1e-4)
+    usable = energies >= floor
+    if not np.any(usable):
+        return 0.0, 0.0, 0.0
+    ncc = np.full(energies.shape, -np.inf, dtype=np.float64)
+    denom = np.sqrt(energies[usable]) * q_norm
+    ncc[usable] = np.clip(corr[lv[usable] + m - 1] / denom, -1.0, 1.0)
     bi = int(np.argmax(ncc))
     score = float(ncc[bi])
     best_lag = float(lv[bi])
@@ -295,6 +303,29 @@ def chroma_xcorr_offset(
         ratio = 99.0
 
     return best_lag * hop_sec, score, ratio
+
+
+def _keep_later_phrase(
+    *,
+    kind: str,
+    score: float,
+    ratio: float,
+    chain_ncc: float,
+) -> bool:
+    """Keep a later hit when the chain point is a different vocal.
+
+    Demucs can keep singing a part the lead acapella does not contain.
+    The next lead phrase then matches after that part. A chain correlation
+    near zero plus a distinct later peak is that entrance, even when the
+    absolute score sits just under the usual bar.
+    """
+    if kind != "wave" or chain_ncc > 0.25:
+        return False
+    if score < chain_ncc + 0.40:
+        return False
+    if score >= 0.55:
+        return True
+    return score >= 0.45 and ratio >= 2.0
 
 
 def _ncc_near(
@@ -517,9 +548,12 @@ def place_segments(
             search_pad = 2.0 if not prefer_wave else 1.0
 
         # Search only near the chain point — unbounded search locks onto
-        # later repeats in songs with similar verses/choruses.
+        # later repeats in songs with similar verses/choruses. The opening
+        # phrase may still *accept* a pad past the short jump cap when the
+        # peak sits inside this window (Hey Mr. DJ: +24s chroma).
         search_start = max(0.0, chained - search_pad)
         earliest = search_start if i == 0 else None
+        jump_cap = MAX_LONG_JUMP_SEC if i == 0 else MAX_FORWARD_JUMP_SEC
         max_lag = MAX_FORWARD_JUMP_SEC + search_pad
         ref_end = min(len(ref_v) / sr, search_start + max_lag + dur + 1.0)
         ref = ref_v[int(search_start * sr) : int(ref_end * sr)]
@@ -532,7 +566,7 @@ def place_segments(
         )
         candidate = search_start + lag
         jump = candidate - prev_dst_b
-        accepted = jump <= MAX_FORWARD_JUMP_SEC and _accept_match(
+        accepted = jump <= jump_cap and _accept_match(
             score=score,
             ratio=ratio,
             dur=dur,
@@ -549,7 +583,7 @@ def place_segments(
             )
             ccand = search_start + clag
             cjump = ccand - prev_dst_b
-            if cjump <= MAX_FORWARD_JUMP_SEC and _accept_match(
+            if cjump <= jump_cap and _accept_match(
                 score=cscore,
                 ratio=cratio,
                 dur=dur,
@@ -561,7 +595,7 @@ def place_segments(
                 candidate, score, ratio, kind = ccand, cscore, cratio, "chroma"
                 jump = cjump
                 accepted = True
-        long_jump = False
+        long_jump = bool(accepted and jump > MAX_FORWARD_JUMP_SEC)
         if not accepted:
             long_max = MAX_LONG_JUMP_SEC + search_pad
             long_end = min(len(ref_v) / sr, search_start + long_max + dur + 1.0)
@@ -586,44 +620,50 @@ def place_segments(
                 accepted = True
                 long_jump = True
 
-        # Chaining into a long Demucs rest puts singing where the vocal
-        # is silent. The real entrance is often just past the 22s window
-        # (Crystal Ship: 1:08 in the output, 1:30 in Demucs).
+        # Chaining into a long rest puts singing where the vocal is silent.
+        # The entrance is the end of that rest (Crystal Ship: the phrase
+        # sits just after the gap). A search over the rest of the song
+        # locks onto a later repeat instead (SAD!: 2:08 chained, 2:20 won).
         if not accepted:
             rest_run = silence_run_containing(ref_v, sr, chained)
             if rest_run is not None and (rest_run[1] - rest_run[0]) >= 2.5:
-                rescue_max = MAX_LONG_JUMP_SEC + search_pad
-                rescue_end = min(
-                    len(ref_v) / sr, search_start + rescue_max + dur + 1.0
-                )
-                ref_rescue = ref_v[int(search_start * sr) : int(rescue_end * sr)]
+                entrance = rest_run[1]
+                look = 2.5
+                search_from = max(0.0, entrance - 0.5)
+                search_span = look + 0.5
+                rescue_end = min(len(ref_v) / sr, search_from + search_span + dur + 0.5)
+                ref_rescue = ref_v[int(search_from * sr) : int(rescue_end * sr)]
                 rlag, rscore, rratio, rkind = _match_offset(
                     ref_rescue,
                     seg,
                     sr=sr,
                     prefer_wave=prefer_wave,
-                    max_lag_sec=rescue_max,
+                    max_lag_sec=search_span,
                 )
-                rcand = search_start + rlag
+                rcand = search_from + rlag
                 rjump = rcand - prev_dst_b
-                wave_ok = rjump <= MAX_LONG_JUMP_SEC and _accept_match(
-                    score=rscore,
-                    ratio=rratio,
-                    dur=dur,
-                    candidate=rcand,
-                    prev_dst_b=prev_dst_b,
-                    kind=rkind,
-                    earliest=earliest,
+                wave_ok = (
+                    entrance - 0.5 <= rcand <= entrance + look
+                    and rjump <= MAX_LONG_JUMP_SEC
+                    and _accept_match(
+                        score=rscore,
+                        ratio=rratio,
+                        dur=dur,
+                        candidate=rcand,
+                        prev_dst_b=prev_dst_b,
+                        kind=rkind,
+                        earliest=earliest,
+                    )
                 )
                 if rkind == "wave" and not wave_ok:
                     clag, cscore, cratio = chroma_xcorr_offset(
-                        ref_rescue, seg, sr=sr, max_lag_sec=rescue_max
+                        ref_rescue, seg, sr=sr, max_lag_sec=search_span
                     )
-                    rcand = search_start + clag
+                    rcand = search_from + clag
                     rjump = rcand - prev_dst_b
                     rscore, rratio, rkind = cscore, cratio, "chroma"
                 if (
-                    rest_run[1] - 0.4 <= rcand
+                    entrance - 0.5 <= rcand <= entrance + look
                     and rjump <= MAX_LONG_JUMP_SEC
                     and _accept_match(
                         score=rscore,
@@ -661,11 +701,11 @@ def place_segments(
                     chain_ncc = (
                         _ncc_near(ref_v, seg, chained, sr) if kind == "wave" else 1.0
                     )
-                    if (
-                        kind == "wave"
-                        and score >= 0.55
-                        and chain_ncc <= 0.25
-                        and score >= chain_ncc + 0.40
+                    if _keep_later_phrase(
+                        kind=kind,
+                        score=score,
+                        ratio=ratio,
+                        chain_ncc=chain_ncc,
                     ):
                         notes.append(
                             f"seg{i}_span_keep={insert_try:.2f}s_rest={rest:.2f}s"
@@ -698,10 +738,10 @@ def place_segments(
                 notes.append(f"seg{i}_match_{kind}={score:.3f}")
         else:
             place = chained
-            if jump > MAX_FORWARD_JUMP_SEC:
+            if jump > jump_cap:
                 notes.append(
                     f"seg{i}_jump_reject={jump:.1f}s>"
-                    f"{MAX_FORWARD_JUMP_SEC:.0f}s_{kind}={score:.3f}"
+                    f"{jump_cap:.0f}s_{kind}={score:.3f}"
                 )
             else:
                 notes.append(
@@ -718,13 +758,14 @@ def snap_tiny_inserts(
     segs: list[tuple[float, float]],
     placements: list[tuple[float, float, float]],
     *,
-    snap_sec: float = 0.06,
+    snap_sec: float = 0.012,
 ) -> tuple[list[tuple[float, float, float]], int]:
-    """Drop sub-60ms join corrections so the source waveform stays intact.
+    """Drop micro-jitter at joins so contiguous source audio is not cut.
 
-    A cut through a sung note is a pop. Placement errors this small are inside
-    the drift budget, so the phrase stays sample-contiguous with the one before
-    it. Real rests (inserts larger than snap_sec) are left alone.
+    A few milliseconds of placement noise can splice mid-note and pop.
+    Gradual Mel/aca tempo drift also lands as many 15–40 ms steps — those
+    are real offset growth, not join noise. Snapping them (the old 60 ms
+    budget) flattened every phrase to the first pad and left the vocal late.
     """
     if len(placements) < 2:
         return placements, 0

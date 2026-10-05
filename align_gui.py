@@ -54,7 +54,9 @@ from check_alignment import (
     DEFAULT_DRIFT_MS,
     DEFAULT_WEAK_WINDOW_FRAC,
     DEFAULT_WINDOW_CORR_MIN,
+    collapse_drift_note,
     drift_ranges,
+    drift_span,
     review_fail_parts,
     review_fail_text,
 )
@@ -131,6 +133,18 @@ def _notes_columns(row: dict) -> tuple[str, str]:
     aca = drift_ranges(aca_pts or []) if row.get("aca_verdict") == "fail" else ""
     inst = drift_ranges(inst_pts or []) if row.get("inst_verdict") == "fail" else ""
     return aca, inst
+
+
+def _editor_notes(row: dict) -> tuple[str, str]:
+    """One overall drift span per stem, for the section editor status line."""
+    aca_pts = row.get("aca_checkpoints")
+    inst_pts = row.get("inst_checkpoints")
+    if isinstance(aca_pts, list) or isinstance(inst_pts, list):
+        aca = drift_span(aca_pts or []) if row.get("aca_verdict") == "fail" else ""
+        inst = drift_span(inst_pts or []) if row.get("inst_verdict") == "fail" else ""
+        return aca, inst
+    aca, inst = review_fail_parts(str(row.get("notes") or ""))
+    return collapse_drift_note(aca), collapse_drift_note(inst)
 COL_FOLDER = 0
 COL_ACA_VERDICT = 1
 COL_INST_VERDICT = 2
@@ -519,7 +533,7 @@ class AlignWorker(QThread):
             self.log.emit(f"Engine: {engine}")
             self.log.emit(f"De-click: {declick_plan.summary}")
             self.log.emit(f"Root:   {root}")
-            self.log.emit("References: Demucs vocal, Demucs instrumental")
+            self.log.emit("Reference: Mel-Band RoFormer vocal and instrumental")
             self.log.emit(f"Songs: {len(folders)}" + ("   dry run" if opts["dry_run"] else ""))
             if opts.get("gaps_cut", True):
                 self.log.emit("Acapella: rests were cut out, they will be put back")
@@ -630,6 +644,7 @@ class AlignWorker(QThread):
 
             rename = bool(opts.get("move_on_pass")) and not opts.get("dry_run")
             self.log.emit("Check alignment. No warp.")
+            self.log.emit("Reference: Mel-Band RoFormer vocal and instrumental")
             self.log.emit(f"Root:   {root}")
             self.log.emit(
                 f"Songs: {len(folders)}" + ("   tagging folders" if rename else "")
@@ -843,6 +858,9 @@ class MainWindow(QWidget):
 
         mid = QSplitter(Qt.Orientation.Horizontal)
         results = QSplitter(Qt.Orientation.Vertical)
+        results.setObjectName("ResultsSplit")
+        results.setHandleWidth(0)
+        results.setChildrenCollapsible(False)
         self.table = QTableWidget(0, 10)
         self.table.setHorizontalHeaderLabels(
             [
@@ -861,11 +879,11 @@ class MainWindow(QWidget):
         header_tips = {
             COL_FOLDER: "Song folder name (processed output path stored on the row).",
             COL_ACA_VERDICT: (
-                "Acapella against the Demucs vocal.\n"
+                "Acapella against the Mel-Band vocal.\n"
                 "Pass or fail uses correlation and drift."
             ),
             COL_INST_VERDICT: (
-                "Instrumental against the Demucs instrumental.\n"
+                "Instrumental against the Mel-Band instrumental.\n"
                 "Pass or fail uses correlation and drift."
             ),
             COL_CORR: "Mix against the original.\nHigher is better.",
@@ -927,10 +945,13 @@ class MainWindow(QWidget):
             "Results for each processed folder.\n"
             "Click a header to sort, or drag an edge to resize.\n"
             "Right-click a row to re-align, play, or edit.\n"
-            "The lag map under the table follows the selected row."
+            "The lag map under the table follows the selected row.\n"
+            "Use the Lag map chevron to hide it and show more rows."
         )
         self.lag_panel = LagMapPanel()
+        self.lag_panel.expandedChanged.connect(self._on_lag_map_expanded)
         self.table.itemSelectionChanged.connect(self._show_lag_map)
+        self.results_split = results
         results.addWidget(self.table)
         results.addWidget(self.lag_panel)
         results.setStretchFactor(0, 3)
@@ -1207,7 +1228,7 @@ class MainWindow(QWidget):
         self.corr_min.setDecimals(2)
         self.corr_min.setValue(DEFAULT_CORR_MIN)
         self.corr_min.setToolTip(
-            "Minimum correlation against the Demucs reference.\n"
+            "Minimum correlation against the Mel-Band reference.\n"
             "Higher is stricter."
         )
 
@@ -1217,7 +1238,7 @@ class MainWindow(QWidget):
         self.drift_ms.setSuffix(" ms")
         self.drift_ms.setValue(DEFAULT_DRIFT_MS)
         self.drift_ms.setToolTip(
-            "Maximum offset of either stem against its Demucs reference.\n"
+            "Maximum offset of either stem against its Mel-Band reference.\n"
             "Past this limit the stem fails.\n"
             "A slow drift inside the limit still passes."
         )
@@ -1300,7 +1321,7 @@ class MainWindow(QWidget):
         self.edit_btn = QPushButton("Edit")
         self.edit_btn.setObjectName("editBtn")
         self.edit_btn.setToolTip(
-            "Drag sections against the Demucs reference.\n"
+            "Drag sections against the Mel-Band reference.\n"
             "Apply re-aligns the stem you are editing.\n"
             "The other stem is left as it is."
         )
@@ -1548,6 +1569,11 @@ class MainWindow(QWidget):
                 background: transparent;
                 border: none;
             }}
+            QSplitter#ResultsSplit::handle {{
+                background: transparent;
+                border: none;
+                height: 0px;
+            }}
             QSplitter::handle {{
                 background-color: {c['border']};
             }}
@@ -1776,6 +1802,11 @@ class MainWindow(QWidget):
             self.gaps_cut.setChecked(data["gaps_cut"])
         if isinstance(data.get("legacy_lag"), bool):
             self.legacy_lag.setChecked(data["legacy_lag"])
+        if isinstance(data.get("lag_map_expanded"), bool):
+            self.lag_panel.blockSignals(True)
+            self.lag_panel.set_expanded(data["lag_map_expanded"])
+            self.lag_panel.blockSignals(False)
+            self._fit_lag_map_splitter(data["lag_map_expanded"])
 
     def _load_comments(self) -> None:
         try:
@@ -1911,6 +1942,7 @@ class MainWindow(QWidget):
             "move_on_pass": self.move_on_pass.isChecked(),
             "gaps_cut": self.gaps_cut.isChecked(),
             "legacy_lag": self.legacy_lag.isChecked(),
+            "lag_map_expanded": self.lag_panel.is_expanded(),
             "max_pad_sec": self.max_pad.value(),
             "corr_min": self.corr_min.value(),
             "drift_ms": self.drift_ms.value(),
@@ -1950,14 +1982,24 @@ class MainWindow(QWidget):
         self.legacy_lag.toggled.connect(save)
 
     def _schedule_settings_save(self, *_args: object) -> None:
-        self._settings_timer.start()
+        timer = getattr(self, "_settings_timer", None)
+        if timer is not None:
+            timer.start()
 
     def closeEvent(self, event) -> None:  # noqa: N802
         worker = self.worker
         if worker is not None and worker.isRunning():
             worker.abort()
-            worker.wait()
+            # Don't stall the window on a stuck batch; abort already asked it to stop.
+            worker.wait(3000)
             QApplication.processEvents()
+        try:
+            from warp_align_reaper import shutdown_warm_reaper
+
+            # Warm REAPER used to block close for up to ~8s waiting on quit.
+            shutdown_warm_reaper(grace_sec=0.5)
+        except Exception:
+            pass
         self._save_settings()
         self._save_comments()
         # A new run clears the table before the first song finishes. Closing
@@ -1982,6 +2024,21 @@ class MainWindow(QWidget):
             if isinstance(payload, dict):
                 report = payload.get("alignment_report")
         self.lag_panel.set_report(report if isinstance(report, dict) else None)
+
+    def _on_lag_map_expanded(self, expanded: bool) -> None:
+        self._fit_lag_map_splitter(bool(expanded))
+        self._schedule_settings_save()
+
+    def _fit_lag_map_splitter(self, expanded: bool) -> None:
+        total = sum(self.results_split.sizes())
+        if total <= 0:
+            total = max(200, self.results_split.height())
+        if expanded:
+            table = max(120, int(total * 0.62))
+            self.results_split.setSizes([table, max(140, total - table)])
+        else:
+            header = max(24, self.lag_panel.maximumHeight())
+            self.results_split.setSizes([max(120, total - header), header])
 
     def _opts(self) -> dict:
         limit = self.limit_spin.value()
@@ -2133,7 +2190,13 @@ class MainWindow(QWidget):
         worker.start()
         self._sync_progress_button()
 
-    def _open_progress_modal(self, mode: str, folder_total: int, *, stem: str = "aca") -> None:
+    def _open_progress_modal(
+        self,
+        mode: str,
+        folder_total: int,
+        *,
+        stem: str = "aca",
+    ) -> None:
         from progress_modal import ProgressModal
 
         self._close_progress_modal()
@@ -2533,8 +2596,8 @@ class MainWindow(QWidget):
             COL_NOTES_INST: inst_notes.casefold(),
         }
         tips = {
-            COL_ACA_VERDICT: self._stem_tip("Acapella vs Demucs vocal", row, "aca"),
-            COL_INST_VERDICT: self._stem_tip("Instrumental vs Demucs instrumental", row, "inst"),
+            COL_ACA_VERDICT: self._stem_tip("Acapella vs Mel-Band vocal", row, "aca"),
+            COL_INST_VERDICT: self._stem_tip("Instrumental vs Mel-Band instrumental", row, "inst"),
         }
         for c, val in values.items():
             item = SortItem(val)
@@ -2684,6 +2747,48 @@ class MainWindow(QWidget):
                 return root
         return None
 
+    def _notes_for_song(self, song: Path | None) -> dict[str, str]:
+        """Aca/inst review notes for the selected row, or matching folder."""
+        empty = {"aca": "", "inst": ""}
+        if song is None:
+            return empty
+        song_key = self._stem_key(song.name, str(song))
+        selected = self.table.selectionModel().selectedRows()
+        rows = [selected[0].row()] if selected else list(range(self.table.rowCount()))
+        for r in rows:
+            item = self.table.item(r, COL_FOLDER)
+            if item is None:
+                continue
+            path = str(item.data(PATH_ROLE) or "")
+            name = item.text().strip()
+            if path:
+                try:
+                    if Path(path).resolve() != song.resolve():
+                        continue
+                except OSError:
+                    if Path(path) != song:
+                        continue
+            elif self._stem_key(name, path) != song_key and name != song.name:
+                continue
+            raw = item.data(ROW_ROLE)
+            row: dict = {}
+            if isinstance(raw, str) and raw:
+                try:
+                    payload = json.loads(raw)
+                except json.JSONDecodeError:
+                    payload = {}
+                if isinstance(payload, dict):
+                    row = payload
+            aca, inst = _editor_notes(row)
+            if not aca:
+                aca_item = self.table.item(r, COL_NOTES_ACA)
+                aca = collapse_drift_note(aca_item.text() if aca_item is not None else "")
+            if not inst:
+                inst_item = self.table.item(r, COL_NOTES_INST)
+                inst = collapse_drift_note(inst_item.text() if inst_item is not None else "")
+            return {"aca": aca, "inst": inst}
+        return empty
+
     def _edit_selected(self, song: Path | None = None) -> None:
         if not isinstance(song, Path):
             song = self._selected_song_path()
@@ -2700,7 +2805,7 @@ class MainWindow(QWidget):
                 self,
                 "Select a track",
                 "Select a row, then click Edit.\n"
-                "The window shows the Demucs vocal and lets you drag acapella sections.",
+                "The window shows the reference vocal and lets you drag acapella sections.",
             )
             return
         from section_editor import open_section_editor
@@ -2714,6 +2819,7 @@ class MainWindow(QWidget):
                 on_apply_scored=self._editor_apply_scored,
                 on_apply_end=self._editor_apply_end,
                 tag_folders=lambda: self.move_on_pass.isChecked() and not self.dry_run.isChecked(),
+                stem_notes=self._notes_for_song(song),
             )
         except Exception as exc:  # noqa: BLE001
             QMessageBox.critical(self, "Could not open editor", f"{type(exc).__name__}: {exc}")

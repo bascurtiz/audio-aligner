@@ -13,11 +13,14 @@ import json
 import re
 import sys
 import traceback
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
 import numpy as np
+
+# Temp stems written during gap / gain / de-click. Never pick these as inputs.
+_TEMP_AUDIO_MARKERS = ("._gap_tmp", "._gain_tmp", "._adeclick", ".tmp")
 
 DEFAULT_ROOT = Path(
     r"T:\SDR30+\Pair-finder organized done\!2-files\with_original\to-review"
@@ -115,8 +118,15 @@ def _match_length(a: np.ndarray, b: np.ndarray) -> tuple[np.ndarray, np.ndarray]
     return a, b
 
 
+def _is_temp_audio(path: Path) -> bool:
+    name = path.name.lower()
+    return any(marker in name for marker in _TEMP_AUDIO_MARKERS)
+
+
 def classify_audio_file(path: Path) -> str | None:
     if path.suffix.lower() not in AUDIO_EXTS:
+        return None
+    if _is_temp_audio(path):
         return None
     stem = path.stem.lower()
     if "(original song)" in stem:
@@ -197,10 +207,23 @@ def scan_folder(folder: Path) -> tuple[Path | None, Path | None, Path | None, st
 
 
 def _load_mono(path: Path, sr: int) -> np.ndarray:
+    """Decode mono at ``sr``. Prefer soundfile; librosa is the fallback."""
     import librosa
+    import soundfile as sf
 
-    y, _ = librosa.load(str(path), sr=sr, mono=True)
-    return y.astype(np.float32)
+    try:
+        y, file_sr = sf.read(str(path), always_2d=False, dtype="float32")
+        if getattr(y, "ndim", 1) == 2:
+            y = y.mean(axis=1)
+        y = np.asarray(y, dtype=np.float32)
+        if int(file_sr) != int(sr):
+            y = librosa.resample(y, orig_sr=int(file_sr), target_sr=int(sr)).astype(
+                np.float32
+            )
+        return y
+    except Exception:
+        y, _ = librosa.load(str(path), sr=sr, mono=True)
+        return y.astype(np.float32)
 
 
 def _chroma(y: np.ndarray, sr: int) -> np.ndarray:
@@ -208,7 +231,9 @@ def _chroma(y: np.ndarray, sr: int) -> np.ndarray:
 
     if y.size < sr // 4:
         return np.zeros((12, 1), dtype=np.float32)
-    C = librosa.feature.chroma_cqt(y=y, sr=sr, hop_length=HOP_LENGTH)
+    # STFT chroma is ~3× faster than CQT here and keeps the same pass/fail
+    # gate on typical stems (lag still lands on the same hop).
+    C = librosa.feature.chroma_stft(y=y, sr=sr, hop_length=HOP_LENGTH)
     # L2-normalize frames for volume invariance
     norms = np.linalg.norm(C, axis=0, keepdims=True)
     norms = np.maximum(norms, 1e-9)
@@ -822,7 +847,7 @@ def drift_ranges(points: list, *, limit_ms: float = DEFAULT_DRIFT_MS) -> str:
             return
         start = _review_clock(group[0][0] - half)
         end = _review_clock(group[-1][0] + half)
-        parts.append(f"drifts between {start} - {end} ({_review_amount(group)})")
+        parts.append(f"{start} - {end} ({_review_amount(group)})")
         group.clear()
 
     for point in parsed:
@@ -833,7 +858,79 @@ def drift_ranges(points: list, *, limit_ms: float = DEFAULT_DRIFT_MS) -> str:
             _flush()
         group.append(point)
     _flush()
-    return ", ".join(parts)
+    if not parts:
+        return ""
+    return "drifts between: " + ", ".join(parts)
+
+
+def drift_span(points: list, *, limit_ms: float = DEFAULT_DRIFT_MS) -> str:
+    """One start–end covering every failing window. For the editor status line."""
+    half = CHECKPOINT_WIN_SEC / 2.0
+    over: list[tuple[float, float, bool]] = []
+    for point in points or []:
+        parts = _checkpoint_parts(point)
+        if parts is None:
+            continue
+        if parts[2] or abs(parts[1]) > limit_ms:
+            over.append(parts)
+    if not over:
+        return ""
+    t0 = min(point[0] for point in over) - half
+    t1 = max(point[0] for point in over) + half
+    dur = max(0, int(round(t1 - t0)))
+    return f"drifts between: {_review_clock(t0)} - {_review_clock(t1)} ({dur}s)"
+
+
+def collapse_drift_note(text: str) -> str:
+    """Turn several printed ranges into one overall span."""
+    raw = str(text or "").strip()
+    if not raw:
+        return ""
+    span = parse_drift_span(raw)
+    if span is None:
+        return keep_drift_ranges_whole(raw)
+    t0, t1 = span
+    dur = max(0, int(round(t1 - t0)))
+    return f"drifts between: {_review_clock(t0)} - {_review_clock(t1)} ({dur}s)"
+
+
+def parse_drift_span(text: str) -> tuple[float, float] | None:
+    """Start and end seconds from a drift note, or None."""
+    raw = str(text or "").strip()
+    if not raw:
+        return None
+    clocks = re.findall(r"\b(\d+:\d{2}(?::\d{2})?)\b", raw)
+    if len(clocks) < 2:
+        return None
+
+    def _secs(clock: str) -> float:
+        bits = [int(part) for part in clock.split(":")]
+        if len(bits) == 3:
+            return float(bits[0] * 3600 + bits[1] * 60 + bits[2])
+        if len(bits) == 2:
+            return float(bits[0] * 60 + bits[1])
+        return float(bits[0])
+
+    values = [_secs(clock) for clock in clocks]
+    t0 = min(values)
+    t1 = max(values)
+    if t1 <= t0:
+        return None
+    return t0, t1
+
+
+def keep_drift_ranges_whole(text: str) -> str:
+    """Stop a label from wrapping inside one time range."""
+    raw = str(text or "").strip()
+    if not raw:
+        return ""
+    prefix = "drifts between: "
+    body = raw[len(prefix) :] if raw.casefold().startswith(prefix.casefold()) else raw
+    head = prefix if raw.casefold().startswith(prefix.casefold()) else ""
+    chunks = [chunk.strip().replace(" ", "\u00a0") for chunk in body.split(",") if chunk.strip()]
+    if not chunks:
+        return raw
+    return head + ", ".join(chunks)
 
 
 def review_fail_parts(notes: str, *, limit_ms: float = DEFAULT_DRIFT_MS) -> tuple[str, str]:
@@ -950,10 +1047,15 @@ def stem_verdicts(
     """
     from demucs_vocals import load_instrumental_mono, load_vocals_mono
 
-    aca = _load_mono(acapella, sr)
-    inst = _load_mono(instrumental, sr)
-    vox = load_vocals_mono(original, sr, folder=folder)
-    demucs_inst = load_instrumental_mono(original, sr, folder=folder)
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        fut_aca = pool.submit(_load_mono, acapella, sr)
+        fut_inst = pool.submit(_load_mono, instrumental, sr)
+        fut_vox = pool.submit(load_vocals_mono, original, sr, folder=folder)
+        fut_dem = pool.submit(load_instrumental_mono, original, sr, folder=folder)
+        aca = fut_aca.result()
+        inst = fut_inst.result()
+        vox = fut_vox.result()
+        demucs_inst = fut_dem.result()
     # Chroma drift is quantized to ~23 ms, so it cannot host a 10 ms gate.
     kwargs = dict(
         sr=sr,
@@ -964,22 +1066,32 @@ def stem_verdicts(
         window_corr_min=window_corr_min,
         weak_window_frac=weak_window_frac,
     )
-    aca_verdict, aca_corr, aca_lag, aca_drift, _weak, aca_notes = score_alignment(vox, aca, **kwargs)
-    inst_verdict, inst_corr, inst_lag, inst_drift, _weak, inst_notes = score_alignment(
-        demucs_inst, inst, **kwargs
-    )
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        fut_aca = pool.submit(score_alignment, vox, aca, **kwargs)
+        fut_inst = pool.submit(score_alignment, demucs_inst, inst, **kwargs)
+        aca_verdict, aca_corr, aca_lag, aca_drift, _weak, aca_notes = fut_aca.result()
+        inst_verdict, inst_corr, inst_lag, inst_drift, _weak, inst_notes = fut_inst.result()
     coarse_max = max(DEFAULT_COARSE_LAG_MAX_SEC, float(lag_max_sec))
     sample_times, sample_note = checkpoint_sample_times(original)
-    aca_points = checkpoint_offsets(
-        vox, aca, sr, at_times=sample_times, confirm_sec=CHECKPOINT_CONFIRM_LAG_SEC
-    )
-    inst_points = checkpoint_offsets(
-        demucs_inst,
-        inst,
-        sr,
-        at_times=sample_times,
-        confirm_sec=CHECKPOINT_CONFIRM_LAG_SEC,
-    )
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        fut_aca = pool.submit(
+            checkpoint_offsets,
+            vox,
+            aca,
+            sr,
+            at_times=sample_times,
+            confirm_sec=CHECKPOINT_CONFIRM_LAG_SEC,
+        )
+        fut_inst = pool.submit(
+            checkpoint_offsets,
+            demucs_inst,
+            inst,
+            sr,
+            at_times=sample_times,
+            confirm_sec=CHECKPOINT_CONFIRM_LAG_SEC,
+        )
+        aca_points = fut_aca.result()
+        inst_points = fut_inst.result()
     aca_verdict, aca_notes, aca_lag = _apply_offset_gate(
         aca_verdict, aca_notes, aca_lag, aca_points, drift_ms, coarse_max_sec=coarse_max
     )
@@ -1013,6 +1125,134 @@ def stem_verdicts(
             for t, lag, railed in inst_points
         ],
     )
+
+
+def score_rendered_pair(
+    acapella: Path,
+    instrumental: Path,
+    original: Path,
+    *,
+    folder: Path | None = None,
+    sr: int = DEFAULT_SR,
+    max_shift_sec: float = DEFAULT_MAX_SHIFT_SEC,
+    window_sec: float = DEFAULT_WINDOW_SEC,
+    corr_min: float = DEFAULT_CORR_MIN,
+    drift_ms: float = DEFAULT_DRIFT_MS,
+    window_corr_min: float = DEFAULT_WINDOW_CORR_MIN,
+    weak_window_frac: float = DEFAULT_WEAK_WINDOW_FRAC,
+    lag_max_sec: float = DEFAULT_STEM_LAG_MAX_SEC,
+) -> dict:
+    """Mix + per-stem score with shared loads (one decode each).
+
+    Returns ``mix`` (post-render fields) and ``stem`` (per-stem fields).
+    """
+    from demucs_vocals import load_instrumental_mono, load_vocals_mono
+
+    with ThreadPoolExecutor(max_workers=5) as pool:
+        fut_aca = pool.submit(_load_mono, acapella, sr)
+        fut_inst = pool.submit(_load_mono, instrumental, sr)
+        fut_orig = pool.submit(_load_mono, original, sr)
+        fut_vox = pool.submit(load_vocals_mono, original, sr, folder=folder)
+        fut_dem = pool.submit(load_instrumental_mono, original, sr, folder=folder)
+        aca = fut_aca.result()
+        inst = fut_inst.result()
+        orig = fut_orig.result()
+        vox = fut_vox.result()
+        demucs_inst = fut_dem.result()
+
+    aca_n, inst_n = _match_length(_peak_norm(aca), _peak_norm(inst))
+    mix = _peak_norm(aca_n + inst_n)
+    mix_kwargs = dict(
+        sr=sr,
+        max_shift_sec=max_shift_sec,
+        window_sec=window_sec,
+        corr_min=corr_min,
+        drift_ms=drift_ms,
+        window_corr_min=window_corr_min,
+        weak_window_frac=weak_window_frac,
+    )
+    stem_kwargs = dict(
+        sr=sr,
+        max_shift_sec=max_shift_sec,
+        window_sec=window_sec,
+        corr_min=corr_min,
+        drift_ms=max(float(drift_ms), 100.0),
+        window_corr_min=window_corr_min,
+        weak_window_frac=weak_window_frac,
+    )
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        fut_mix = pool.submit(score_alignment, _peak_norm(orig), mix, **mix_kwargs)
+        fut_aca = pool.submit(score_alignment, vox, aca, **stem_kwargs)
+        fut_inst = pool.submit(score_alignment, demucs_inst, inst, **stem_kwargs)
+        mix_verdict, mix_corr, mix_lag, mix_drift, mix_weak, mix_notes = fut_mix.result()
+        aca_verdict, aca_corr, aca_lag, aca_drift, _weak, aca_notes = fut_aca.result()
+        inst_verdict, inst_corr, inst_lag, inst_drift, _weak, inst_notes = fut_inst.result()
+
+    coarse_max = max(DEFAULT_COARSE_LAG_MAX_SEC, float(lag_max_sec))
+    sample_times, sample_note = checkpoint_sample_times(original)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        fut_aca = pool.submit(
+            checkpoint_offsets,
+            vox,
+            aca,
+            sr,
+            at_times=sample_times,
+            confirm_sec=CHECKPOINT_CONFIRM_LAG_SEC,
+        )
+        fut_inst = pool.submit(
+            checkpoint_offsets,
+            demucs_inst,
+            inst,
+            sr,
+            at_times=sample_times,
+            confirm_sec=CHECKPOINT_CONFIRM_LAG_SEC,
+        )
+        aca_points = fut_aca.result()
+        inst_points = fut_inst.result()
+
+    aca_verdict, aca_notes, aca_lag = _apply_offset_gate(
+        aca_verdict, aca_notes, aca_lag, aca_points, drift_ms, coarse_max_sec=coarse_max
+    )
+    inst_verdict, inst_notes, inst_lag = _apply_offset_gate(
+        inst_verdict, inst_notes, inst_lag, inst_points, drift_ms, coarse_max_sec=coarse_max
+    )
+    combined = _combine_stem_verdicts(aca_verdict, inst_verdict)
+    stem_notes = (
+        f"aca_check={aca_verdict} corr={aca_corr:.3f} lag={aca_lag:+.3f}s"
+        f" drift={aca_drift:.1f}ms ({aca_notes}); "
+        f"inst_check={inst_verdict} corr={inst_corr:.3f} lag={inst_lag:+.3f}s"
+        f" drift={inst_drift:.1f}ms ({inst_notes}); {sample_note}"
+    )
+    return {
+        "mix": {
+            "verdict": mix_verdict,
+            "corr": float(mix_corr),
+            "lag_sec": float(mix_lag),
+            "drift_ms": float(mix_drift),
+            "weak_frac": float(mix_weak),
+            "notes": mix_notes,
+        },
+        "stem": {
+            "aca_verdict": aca_verdict,
+            "inst_verdict": inst_verdict,
+            "combined": combined,
+            "aca_corr": float(aca_corr),
+            "inst_corr": float(inst_corr),
+            "aca_drift": float(aca_drift),
+            "inst_drift": float(inst_drift),
+            "aca_lag": float(aca_lag),
+            "inst_lag": float(inst_lag),
+            "notes": stem_notes,
+            "aca_checkpoints": [
+                [round(float(t), 3), round(float(lag) * 1000.0, 1), bool(railed)]
+                for t, lag, railed in aca_points
+            ],
+            "inst_checkpoints": [
+                [round(float(t), 3), round(float(lag) * 1000.0, 1), bool(railed)]
+                for t, lag, railed in inst_points
+            ],
+        },
+    }
 
 
 def apply_stem_check(result, acapella: Path, instrumental: Path, original: Path, **kwargs) -> None:
@@ -1050,6 +1290,44 @@ def apply_stem_check(result, acapella: Path, instrumental: Path, original: Path,
     result.inst_checkpoints = inst_points
     result.verdict = combined
     result.notes += f"; {stem_notes}"
+
+
+def apply_full_score(result, acapella: Path, instrumental: Path, original: Path, **kwargs) -> dict:
+    """Fill mix + stem score fields in one shared-load pass. Returns mix dict."""
+    try:
+        scored = score_rendered_pair(acapella, instrumental, original, **kwargs)
+    except Exception as exc:  # noqa: BLE001 — one bad score must not abort the batch
+        result.aca_verdict = "error"
+        result.inst_verdict = "error"
+        result.verdict = "error"
+        result.notes += f"; score:{type(exc).__name__}:{exc}"
+        return {
+            "verdict": "error",
+            "corr": 0.0,
+            "lag_sec": 0.0,
+            "drift_ms": 0.0,
+            "weak_frac": 1.0,
+            "notes": f"score:{type(exc).__name__}:{exc}",
+        }
+    mix = scored["mix"]
+    stem = scored["stem"]
+    result.corr = mix["corr"]
+    result.lag_sec = mix["lag_sec"]
+    result.drift_ms = mix["drift_ms"]
+    result.notes += f"; {mix['notes']}"
+    result.aca_verdict = stem["aca_verdict"]
+    result.inst_verdict = stem["inst_verdict"]
+    result.aca_corr = stem["aca_corr"]
+    result.inst_corr = stem["inst_corr"]
+    result.aca_check_drift_ms = stem["aca_drift"]
+    result.inst_check_drift_ms = stem["inst_drift"]
+    result.aca_lag_sec = stem["aca_lag"]
+    result.inst_lag_sec = stem["inst_lag"]
+    result.aca_checkpoints = stem["aca_checkpoints"]
+    result.inst_checkpoints = stem["inst_checkpoints"]
+    result.verdict = stem["combined"]
+    result.notes += f"; {stem['notes']}"
+    return mix
 
 
 def _emit_step(on_step, step_id: str) -> None:
@@ -1098,12 +1376,22 @@ def process_folder(
             original=orig.name if orig else "",
         )
 
+    result = CheckResult(
+        folder=name,
+        verdict="error",
+        acapella=aca.name,
+        instrumental=inst.name,
+        original=orig.name,
+        notes=scan_notes,
+    )
     try:
         _emit_step(on_step, "score")
-        verdict, corr, lag, drift, weak, notes = analyze_alignment(
+        mix = apply_full_score(
+            result,
             aca,
             inst,
             orig,
+            folder=folder,
             sr=sr,
             max_shift_sec=max_shift_sec,
             window_sec=window_sec,
@@ -1122,35 +1410,12 @@ def process_folder(
             notes=f"{type(exc).__name__}: {exc}",
         )
 
-    if scan_notes:
-        notes = f"{scan_notes}; {notes}"
-
-    result = CheckResult(
-        folder=name,
-        verdict=verdict,
-        corr=corr,
-        lag_sec=lag,
-        drift_ms=drift,
-        weak_window_frac=weak,
-        acapella=aca.name,
-        instrumental=inst.name,
-        original=orig.name,
-        notes=notes,
-    )
-    apply_stem_check(
-        result,
-        aca,
-        inst,
-        orig,
-        folder=folder,
-        sr=sr,
-        max_shift_sec=max_shift_sec,
-        window_sec=window_sec,
-        corr_min=corr_min,
-        drift_ms=drift_ms,
-        window_corr_min=window_corr_min,
-        weak_window_frac=weak_window_frac,
-    )
+    verdict = mix["verdict"]
+    corr = mix["corr"]
+    lag = mix["lag_sec"]
+    drift = mix["drift_ms"]
+    weak = mix["weak_frac"]
+    result.weak_window_frac = weak
     from align_model.quality import stamp_result
 
     stamp_result(result, mix_verdict=verdict, mix_corr=corr, mix_lag=lag, mix_drift=drift)

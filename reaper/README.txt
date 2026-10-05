@@ -33,6 +33,6 @@ If you see errors about missing rendered.wav:
 
 NOTES
 -----
-- Slower than Rubber Band (REAPER starts per stem).
+- A warm REAPER worker stays up between songs in one session (faster than a cold start per stem).
 - Do not use REAPER for other work during a batch.
 - Faster free path: warp_align_fail_all.py (Rubber Band)

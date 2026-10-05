@@ -4,8 +4,11 @@ librosa>=0.10
 soundfile>=0.12
 tqdm>=4.65
 pyrubberband>=0.4.0
-# loudness match vs original mix balance (warp_align_reaper):
-demucs>=4.0.0
+# Kimberley Jensen Mel-Band RoFormer vocal split:
 torch
+einops==0.6.1
+beartype==0.14.1
+rotary-embedding-torch==0.3.5
+pyyaml>=6
 # GUI
 PyQt6>=6.5

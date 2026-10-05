@@ -6,6 +6,7 @@ import unittest
 
 import numpy as np
 
+from aca_gap_align import _keep_later_phrase, place_segments, snap_tiny_inserts, waveform_ncc_offset
 from align_model.benchmark import (
     SR,
     case_continuous_vocal,
@@ -24,14 +25,33 @@ from align_model.benchmark import (
     measure_curve,
 )
 from align_model.beats import beat_alignment_score
-from align_model.evidence import EvidencePoint, context_weights, fuse_candidates
-from align_model.gaps import MapSpan, PhraseUnit, render_gap_aware, spans_from_units
+from align_model.evidence import (
+    AlignmentEvidence,
+    EvidencePoint,
+    context_weights,
+    extract_evidence,
+    fuse_candidates,
+)
+from align_model.gaps import MapSpan, PhraseUnit, render_gap_aware, spans_from_units, trim_span_to_file, _needs_elastique
 from align_model.params import resolve_profile
-from align_model.pipeline import _model_phrase, _with_silence, map_from_points
+from align_model.pipeline import (
+    _cover_placed_edges,
+    _dst_at_src,
+    _front_silence_pad,
+    _hold_placed_entrance,
+    _model_phrase,
+    _with_silence,
+    combine_reports,
+    map_from_points,
+    map_stem,
+)
 from align_model.quality import apply_codes, is_compensating, stamp_result
 from align_model.time_map import (
     _clamp_accel,
     adaptive_marker_times,
+    fit_reference_gaps,
+    pull_unmatched_phrase,
+    refine_lags_with_envelope,
     solve_constrained_lag_path,
     source_on_padded_wav,
     src_dst_from_lags,
@@ -115,6 +135,18 @@ class EvidenceTests(unittest.TestCase):
         self.assertGreater(landed, 0.85)
         self.assertGreater(landed, off_beat)
 
+    def test_query_longer_than_the_reference_still_scores(self) -> None:
+        sr = 22050
+        rng = np.random.default_rng(0)
+        ref = (rng.standard_normal(sr * 12) * 0.05).astype(np.float32)
+        qry = (rng.standard_normal(sr * 20) * 0.05).astype(np.float32)
+        burst = np.hanning(sr).astype(np.float32)
+        ref[sr : 2 * sr] += burst
+        qry[sr : 2 * sr] += burst
+        profile = resolve_profile(ref, sr)
+        evidence = extract_evidence(ref, qry, sr, profile=profile, kind="instrumental")
+        self.assertGreater(len(evidence.points), 0)
+
 
 class TimeMapTests(unittest.TestCase):
     def _points(self, lag_at) -> list[EvidencePoint]:
@@ -157,6 +189,37 @@ class TimeMapTests(unittest.TestCase):
         )
         near = np.argmin(np.abs(stem.times - 4.0))
         self.assertGreater(abs(float(stem.lags[near])), 0.08)
+
+    def test_beat_snap_does_not_walk_off_a_steady_offset(self) -> None:
+        """A half-beat snap must not make a constant instrumental early, then late."""
+        points = []
+        for t in np.arange(1.0, 17.0, 1.0):
+            margin = 0.2 if 8.0 <= t <= 12.0 else 0.0
+            points.append(
+                EvidencePoint(
+                    time=float(t),
+                    lag=-0.33,
+                    confidence=0.7,
+                    best_score=0.7,
+                    second_score=0.5 if margin else 0.7,
+                    match_margin=margin,
+                )
+            )
+        evidence = AlignmentEvidence(points=points, profile="default", kind="instrumental")
+        evidence.query_onsets = [float(t) + 0.33 + 0.18 for t in np.arange(1.0, 17.0, 1.0)]
+        stem = map_stem(
+            np.zeros(8, dtype=np.float32),
+            np.zeros(8, dtype=np.float32),
+            1,
+            kind="instrumental",
+            beats=np.arange(0.0, 20.0, 0.47),
+            downbeats=np.arange(0.0, 20.0, 1.88),
+            target_sec=17.0,
+            in_sec=17.0,
+            evidence=evidence,
+        )
+        for t, lag in zip(stem.times, stem.lags):
+            self.assertLess(abs(float(lag) - (-0.33)), 0.04, f"t={t:.2f} lag={lag:+.3f}")
 
     def test_ambiguous_point_follows_the_line(self) -> None:
         beats = np.arange(0.0, 8.0, 0.5)
@@ -257,7 +320,11 @@ class TimeMapTests(unittest.TestCase):
         profile = resolve_profile(None, 0, name="default", max_pad_sec=0.50)
         late = map_from_points(self._points(lambda t: (0.80, 0.9, 0.4)), profile=profile, target_sec=8.0, in_sec=8.0)
         self.assertTrue(late.report.get("pad_rejected"))
+        self.assertEqual(late.report.get("map_rejected"), "pad_limit")
+        self.assertTrue(late.report.get("identity_fallback"))
+        self.assertEqual(late.report.get("map_type"), "identity_fallback")
         self.assertAlmostEqual(late.pad_sec, 0.0)
+        self.assertAlmostEqual(late.render_pad_sec, 0.0)
         self.assertGreater(abs(float(late.report["measured_pad_sec"])), 0.50)
         self.assertAlmostEqual(float(late.src[0]), 0.0)
         self.assertAlmostEqual(float(late.src[-1]), 8.0)
@@ -266,6 +333,48 @@ class TimeMapTests(unittest.TestCase):
         self.assertAlmostEqual(kept.pad_sec, 0.20, delta=0.03)
         src_at = float(np.interp(4.0, kept.dst, kept.src))
         self.assertAlmostEqual(src_at, 3.80, delta=0.04)
+
+    def test_front_silence_is_a_pad_the_local_search_cannot_see(self) -> None:
+        """A lead-in longer than max_lag delays the stem instead of leaving the gap at the end."""
+        sr = 22050
+        tone = np.sin(2 * np.pi * 220.0 * np.arange(3 * sr) / sr).astype(np.float32) * 0.5
+        ref = np.concatenate([np.zeros(2 * sr, dtype=np.float32), tone])
+        profile = resolve_profile(None, 0, name="default", max_lag_sec=0.40, max_pad_sec=10.0)
+        stem = map_stem(
+            ref,
+            tone,
+            sr,
+            kind="instrumental",
+            profile=profile,
+            target_sec=len(ref) / sr,
+            in_sec=len(tone) / sr,
+        )
+        self.assertGreater(stem.pad_sec, 1.6)
+        self.assertLess(stem.pad_sec, 2.4)
+        where = float(np.interp(0.0, stem.src, stem.dst))
+        self.assertAlmostEqual(where, 2.0, delta=0.35)
+
+    def test_repeating_onset_yields_to_the_matching_body(self) -> None:
+        """A loud decoy shares the first onset. The pad follows the later copy that matches."""
+        sr = 22050
+        pattern = (0.12, 0.40, 0.12, 0.18, 0.55, 0.12, 0.30)
+
+        def bursts(freq: float) -> np.ndarray:
+            pieces = []
+            for dur in pattern:
+                t = np.arange(int(dur * sr)) / sr
+                pieces.append((np.sin(2 * np.pi * freq * t) * 0.6).astype(np.float32))
+                pieces.append(np.zeros(int(0.35 * sr), dtype=np.float32))
+            return np.concatenate(pieces)
+
+        body = bursts(220.0)
+        t = np.arange(12 * sr) / sr
+        decoy = (np.sin(2 * np.pi * 330.0 * t) * 0.6).astype(np.float32)
+        ref = np.concatenate([np.zeros(2 * sr, dtype=np.float32), body, np.zeros(56 * sr, dtype=np.float32)])
+        qry = np.concatenate([decoy, body, np.zeros(48 * sr, dtype=np.float32)])
+        profile = resolve_profile(None, 0, name="default", max_lag_sec=1.5, max_pad_sec=30.0)
+        pad = _front_silence_pad(ref, qry, sr, profile)
+        self.assertAlmostEqual(pad, -10.0, delta=0.5)
 
     def test_renderer_pad_round_trip(self) -> None:
         """Stored source time 10.000 s plus the pad is the padded-file position."""
@@ -375,6 +484,92 @@ class TimeMapTests(unittest.TestCase):
         recorded = stem.report["rate_limit"]
         self.assertEqual(set(recorded), {"max_sec", "rms_sec", "n_modified"})
 
+    def test_short_envelope_pulls_a_late_hit_onto_the_waveform(self) -> None:
+        """A hit 40 ms off the solved lag moves. A hit already on it stays."""
+        sr = 22050
+        n = int(3.0 * sr)
+        ref = np.zeros(n, dtype=np.float32)
+        qry = np.zeros(n, dtype=np.float32)
+        click = np.hanning(int(0.08 * sr)).astype(np.float32)
+        for t, extra in ((1.0, 0.0), (2.0, 0.040)):
+            a = int(t * sr)
+            ref[a : a + len(click)] = click
+            b = int((t + 0.20 + extra) * sr)
+            qry[b : b + len(click)] = click
+        times = np.array([1.0, 2.0])
+        lags = np.array([-0.20, -0.20])
+        refined = refine_lags_with_envelope(ref, qry, sr, times, lags)
+        self.assertLess(abs(float(refined[0]) - (-0.20)), 0.008)
+        self.assertLess(abs(float(refined[1]) - (-0.24)), 0.008)
+
+    def test_unmatched_opening_phrase_moves_onto_its_transient(self) -> None:
+        """A phrase 240 ms late moves. The matched section after it stays."""
+        sr = 22050
+        n = int(16.0 * sr)
+        ref = np.zeros(n, dtype=np.float32)
+        qry = np.zeros(n, dtype=np.float32)
+        pattern = (0.05, 0.14, 0.05, 0.22)
+
+        def burst(y: np.ndarray, at: float) -> None:
+            t = at
+            for dur in pattern:
+                a = int(t * sr)
+                samples = int(dur * sr)
+                y[a : a + samples] = np.hanning(samples).astype(np.float32)
+                t += dur + 0.09
+
+        burst(ref, 5.0)
+        burst(qry, 5.24)
+        click = np.hanning(int(0.04 * sr)).astype(np.float32)
+        for t in np.arange(10.0, 15.0, 0.5):
+            a = int(t * sr)
+            ref[a : a + len(click)] = click
+            qry[a : a + len(click)] = click
+        times = np.arange(4.0, 14.0, 1.0)
+        lags = np.zeros(len(times), dtype=float)
+        moved = pull_unmatched_phrase(ref, qry, sr, times, lags)
+        at_five = float(moved[np.argmin(np.abs(times - 5.0))])
+        at_twelve = float(moved[np.argmin(np.abs(times - 12.0))])
+        self.assertLess(at_five, -0.15)
+        self.assertGreater(at_five, -0.36)
+        self.assertLess(abs(at_twelve), 0.04)
+
+    def test_short_stem_gap_opens_with_the_reference_silence(self) -> None:
+        """The phrase ends when the reference goes quiet. The hit after the gap stays."""
+        sr = 22050
+        n = int(14.0 * sr)
+        ref = np.zeros(n, dtype=np.float32)
+        qry = np.zeros(n, dtype=np.float32)
+        # Reference is quiet from 7.4 to 8.1. The stem keeps sounding until 7.8.
+        ref[int(5.0 * sr) : int(7.4 * sr)] = 0.45
+        qry[int(5.0 * sr) : int(7.8 * sr)] = 0.45
+        click = np.hanning(int(0.08 * sr)).astype(np.float32) * 0.9
+        ref[int(8.1 * sr) : int(8.1 * sr) + len(click)] = click
+        qry[int(8.1 * sr) : int(8.1 * sr) + len(click)] = click
+        # A later matched section, so the file is long enough to score.
+        for t in np.arange(9.5, 13.0, 0.4):
+            a = int(t * sr)
+            ref[a : a + len(click)] = click * 0.5
+            qry[a : a + len(click)] = click * 0.5
+        times = np.arange(4.0, 13.0, 1.0)
+        lags = np.zeros(len(times), dtype=float)
+        new_t, new_lag, pins = fit_reference_gaps(ref, qry, sr, times, lags)
+        self.assertGreaterEqual(len(pins), 2)
+        lag_at_silence = float(np.interp(7.4, new_t, new_lag))
+        lag_at_hit = float(np.interp(8.1, new_t, new_lag))
+        self.assertAlmostEqual(7.4 - lag_at_silence, 7.8, delta=0.08)
+        self.assertAlmostEqual(lag_at_hit, 0.0, delta=0.05)
+
+    def test_rate_limiter_returns_after_a_blip(self) -> None:
+        """One clamped corner must not leave the lag early for the rest of the file."""
+        times = np.arange(0.0, 24.0, 1.0)
+        lag = np.full(len(times), -0.33)
+        lag[6] = -0.36
+        limited, stats = _clamp_accel(times, lag, 0.02)
+        self.assertGreater(stats["n_modified"], 0)
+        tail = limited[14:]
+        self.assertLess(float(np.max(np.abs(tail - (-0.33)))), 0.01)
+
     def test_jumps_and_spikes_in_the_marker_map(self) -> None:
         def hold(step: float):
             def lag_at(t: float):
@@ -419,6 +614,12 @@ class GapTests(unittest.TestCase):
         i1 = int(silence.dst_end * 8000) - 20
         self.assertLess(float(np.max(np.abs(out[i0:i1]))), 1e-6)
 
+    def test_near_identity_phrases_skip_elastique(self) -> None:
+        """A 1%% length change is paste work. Only larger warps need REAPER."""
+        self.assertFalse(_needs_elastique(44100, 44100, 44100))
+        self.assertFalse(_needs_elastique(44100, int(44100 * 1.01), 44100))
+        self.assertTrue(_needs_elastique(44100, int(44100 * 1.05), 44100))
+
     def test_two_phrases_keep_their_reference_slots(self) -> None:
         """Removed internal silence stays silent, and each phrase keeps its reference slot."""
         sr = 8000
@@ -449,21 +650,302 @@ class GapTests(unittest.TestCase):
         self.assertLess(abs(peak_hz(early) - 196.0), 4.0)
         self.assertLess(abs(peak_hz(late) - 330.0), 4.0)
 
+    def test_source_tail_survives_the_stall(self) -> None:
+        """The decay after the silence gate stays in the render. The inserted rest does not."""
+        sr = 8000
+        phrase = np.ones(sr, dtype=np.float32)
+        tail = np.linspace(0.6, 0.05, int(0.8 * sr), dtype=np.float32)
+        rest = np.zeros(int(1.2 * sr), dtype=np.float32)
+        nxt = np.full(sr, 0.25, dtype=np.float32)
+        y = np.concatenate([phrase, tail, rest, nxt])
+        units = [
+            PhraseUnit(0.0, 1.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.9, 0.4),
+            PhraseUnit(3.0, 4.0, 4.0, 5.0, 1.0, 1.0, 0.0, 0.9, 0.4),
+        ]
+        spans = spans_from_units(units, 6.0)
+        out = render_gap_aware(y, sr, spans, 6 * sr, engine="linear")[:, 0]
+        kept = out[int(1.15 * sr) : int(1.6 * sr)]
+        self.assertGreater(float(np.max(np.abs(kept))), 0.2)
+        stall = out[int(2.4 * sr) : int(3.4 * sr)]
+        self.assertLess(float(np.max(np.abs(stall))), 1e-5)
+        second = out[int(4.2 * sr) : int(4.8 * sr)]
+        self.assertGreater(float(np.mean(np.abs(second))), 0.15)
+
     def test_short_speech_keeps_its_solved_duration(self) -> None:
         spans = _with_silence(
             [
-                MapSpan("speech", 0.0, 0.20, 1.00, 1.20),
-                MapSpan("speech", 0.20, 0.215, 1.10, 1.115),
-                MapSpan("speech", 0.215, 0.215, 1.50, 1.50),
+                MapSpan("speech", 0.0, 0.015, 1.0, 1.015),
+                MapSpan("speech", 0.015, 0.015, 1.5, 1.5),
             ],
             2.0,
         )
         speech = [span for span in spans if span.kind == "speech"]
-        self.assertAlmostEqual(speech[0].dst_end - speech[0].dst_start, 0.20, places=4)
-        self.assertAlmostEqual(speech[1].dst_start, 1.20, places=4)
-        self.assertAlmostEqual(speech[1].dst_end - speech[1].dst_start, 0.015, places=4)
-        self.assertGreater(speech[2].dst_end, speech[2].dst_start)
-        self.assertLess(speech[2].dst_end - speech[2].dst_start, 0.005)
+        self.assertAlmostEqual(speech[0].dst_end - speech[0].dst_start, 0.015, places=4)
+        self.assertGreater(speech[1].dst_end, speech[1].dst_start)
+        self.assertLess(speech[1].dst_end - speech[1].dst_start, 0.005)
+
+    def test_overlap_clips_the_earlier_phrase(self) -> None:
+        spans = _with_silence(
+            [
+                MapSpan("speech", 0.0, 1.0, 11.0, 12.0),
+                MapSpan("speech", 1.0, 2.0, 11.9, 12.9),
+            ],
+            14.0,
+        )
+        speech = [span for span in spans if span.kind == "speech"]
+        self.assertEqual(len(speech), 2)
+        self.assertAlmostEqual(speech[0].dst_end, 11.9, places=3)
+        self.assertAlmostEqual(speech[0].src_end, 0.9, places=3)
+        self.assertAlmostEqual(speech[1].dst_start, 11.9, places=3)
+        self.assertAlmostEqual(speech[1].dst_end, 12.9, places=3)
+
+    def test_uncovered_edge_uses_the_detector_placement(self) -> None:
+        unit = PhraseUnit(0.0, 2.0, 10.0, 12.0, 10.0, 10.0, 0.0, 0.9, 0.4)
+        late_dest = _cover_placed_edges([MapSpan("speech", 0.0, 1.5, 10.08, 11.5)], unit)
+        self.assertAlmostEqual(late_dest[0].dst_start, 10.0, places=3)
+        self.assertAlmostEqual(late_dest[0].src_start, 0.0, places=3)
+        short_source = _cover_placed_edges([MapSpan("speech", 0.0, 1.5, 10.0, 12.0)], unit)
+        self.assertAlmostEqual(short_source[-1].src_end, 2.0, places=3)
+        self.assertAlmostEqual(short_source[-1].dst_end, 12.0, places=3)
+
+    def test_missing_demucs_part_keeps_the_later_entrance(self) -> None:
+        """A distinct later peak stays when the chain is a vocal the acapella lacks."""
+        self.assertTrue(
+            _keep_later_phrase(kind="wave", score=0.53, ratio=14.2, chain_ncc=0.03)
+        )
+        self.assertTrue(
+            _keep_later_phrase(kind="wave", score=0.63, ratio=15.0, chain_ncc=0.02)
+        )
+        self.assertFalse(
+            _keep_later_phrase(kind="wave", score=0.53, ratio=1.1, chain_ncc=0.03)
+        )
+        self.assertFalse(
+            _keep_later_phrase(kind="wave", score=0.80, ratio=4.0, chain_ncc=0.70)
+        )
+        self.assertFalse(
+            _keep_later_phrase(kind="wave", score=0.40, ratio=20.0, chain_ncc=0.0)
+        )
+
+    def test_pre_roll_before_the_file_stays_silent(self) -> None:
+        """Source before time 0 is silence. It must not pull the attack early."""
+        span = trim_span_to_file(MapSpan("speech", -0.115, 3.878, 2.445, 6.438), 10.0)
+        self.assertIsNotNone(span)
+        assert span is not None
+        self.assertGreaterEqual(span.src_start, 0.0)
+        rate = (span.dst_end - span.dst_start) / (span.src_end - span.src_start)
+        attack = span.dst_start + (0.202 - span.src_start) * rate
+        self.assertGreater(attack, 2.74)
+        self.assertLess(attack, 2.78)
+        sr = 8000
+        click_at = int(0.202 * sr)
+        audio = np.zeros((int(4.0 * sr), 1), dtype=np.float32)
+        audio[click_at : click_at + 40, 0] = 1.0
+        rendered = render_gap_aware(
+            audio,
+            sr,
+            [MapSpan("speech", -0.115, 3.878, 2.445, 6.438)],
+            int(8.0 * sr),
+            engine="linear",
+        )
+        energy = np.sqrt(np.mean(rendered.reshape(-1) ** 2))
+        self.assertGreater(energy, 0.0)
+        hop = int(0.002 * sr)
+        first = None
+        for i in range(0, len(rendered) - hop, hop):
+            if float(np.max(np.abs(rendered[i : i + hop]))) > 0.2:
+                first = i / sr
+                break
+        self.assertIsNotNone(first)
+        assert first is not None
+        self.assertGreater(first, 2.74)
+        self.assertLess(first, 2.80)
+
+    def test_early_lock_keeps_the_placed_entrance(self) -> None:
+        """A map that opens on the vocal before the placement is discarded."""
+        unit = PhraseUnit(10.0, 14.0, 40.0, 44.0, 30.0, 30.0, 0.0, 0.9, 0.4)
+        locked = _hold_placed_entrance([MapSpan("speech", 10.0, 14.0, 38.4, 42.4)], unit)
+        self.assertIsNone(locked)
+        nudge = _hold_placed_entrance([MapSpan("speech", 10.0, 14.0, 39.95, 43.95)], unit)
+        self.assertIsNotNone(nudge)
+        self.assertAlmostEqual(nudge[0].dst_start, 39.95, places=3)
+
+    def test_weak_placement_keeps_a_confident_earlier_map(self) -> None:
+        """A 0.13 placement can sit late. A confident map a fraction earlier stands."""
+        unit = PhraseUnit(10.0, 14.0, 40.0, 44.0, 30.0, 30.0, 0.0, 0.13, 0.08)
+        kept = _hold_placed_entrance(
+            [MapSpan("speech", 10.0, 14.0, 39.78, 43.78)],
+            unit,
+            map_confidence=0.91,
+        )
+        self.assertIsNotNone(kept)
+        self.assertAlmostEqual(kept[0].dst_start, 39.78, places=3)
+        unsure = _hold_placed_entrance(
+            [MapSpan("speech", 10.0, 14.0, 39.78, 43.78)],
+            unit,
+            map_confidence=0.30,
+        )
+        self.assertIsNone(unsure)
+        far = _hold_placed_entrance(
+            [MapSpan("speech", 10.0, 14.0, 38.4, 42.4)],
+            unit,
+            map_confidence=0.91,
+        )
+        self.assertIsNone(far)
+
+    def test_long_phrase_does_not_start_on_the_lookbehind(self) -> None:
+        """The entrance stays where it was placed when Demucs still has vocal just before it."""
+        dur = 36.0
+        phrase = harmonic(SR, dur, 220.0)
+        total = int(80.0 * SR)
+        ref = np.zeros(total, dtype=np.float32)
+        qry = np.zeros(total, dtype=np.float32)
+        placed = 40.0
+        src = 2.0
+        decoy = placed - 1.7
+        opening = phrase[: int(2.0 * SR)]
+        ref[int(decoy * SR) : int(decoy * SR) + len(opening)] = opening
+        ref[int(placed * SR) : int(placed * SR) + len(phrase)] = phrase
+        qry[int(src * SR) : int(src * SR) + len(phrase)] = phrase
+        unit = PhraseUnit(src, src + dur, placed, placed + dur, placed - src, placed - src, 0.0, 0.9, 0.4)
+        profile = resolve_profile(ref, SR, name="default")
+        spans = _model_phrase(unit, qry, ref, SR, profile, None, None)
+        self.assertIsNotNone(spans)
+        self.assertGreater(_dst_at_src(spans, src), placed - 0.15)
+
+    def test_phrase_model_rejects_a_stolen_earlier_source(self) -> None:
+        """A multi-second pad that reaches before the phrase is discarded."""
+        dur = 5.0
+        earlier = harmonic(SR, 3.0, 196.0)
+        phrase = harmonic(SR, dur, 247.0)
+        total = int(30.0 * SR)
+        ref = np.zeros(total, dtype=np.float32)
+        qry = np.zeros(total, dtype=np.float32)
+        src = 5.0
+        placed = 12.0
+        # Earlier lead vocal sits before the phrase in the acapella.
+        qry[int(1.0 * SR) : int(1.0 * SR) + len(earlier)] = earlier
+        qry[int(src * SR) : int(src * SR) + len(phrase)] = phrase
+        # Demucs only has that earlier vocal in the lookbehind, then silence,
+        # then the real phrase. A body pad can lock onto the decoy.
+        ref[int((placed - 4.2) * SR) : int((placed - 4.2) * SR) + len(earlier)] = earlier
+        ref[int(placed * SR) : int(placed * SR) + len(phrase)] = phrase
+        unit = PhraseUnit(
+            src, src + dur, placed, placed + dur, placed - src, placed - src, 0.0, 0.05, 0.02
+        )
+        profile = resolve_profile(ref, SR, name="default", max_pad_sec=10.0)
+        spans = _model_phrase(unit, qry, ref, SR, profile, None, None)
+        if spans is None:
+            return
+        for span in spans:
+            self.assertGreaterEqual(float(span.src_start), src - 0.35)
+
+    def test_short_phrase_is_not_stretched_across_the_lookahead(self) -> None:
+        dur = 0.95
+        phrase = harmonic(SR, dur, 330.0)
+        total = int(8.0 * SR)
+        ref = np.zeros(total, dtype=np.float32)
+        qry = np.zeros(total, dtype=np.float32)
+        src = 1.0
+        placed = 3.0
+        n = len(phrase)
+        ref[int(placed * SR) : int(placed * SR) + n] = phrase
+        qry[int(src * SR) : int(src * SR) + n] = phrase
+        unit = PhraseUnit(
+            src, src + dur, placed, placed + dur, placed - src, placed - src, 0.0, 0.4, 0.2
+        )
+        profile = resolve_profile(ref, SR, name="default")
+        spans = _model_phrase(unit, qry, ref, SR, profile, None, None)
+        if spans is None:
+            return
+        for span in spans:
+            width = float(span.src_end - span.src_start)
+            rate = float(span.dst_end - span.dst_start) / width
+            self.assertLess(rate, 1.08, f"rate {rate:.3f}")
+        self.assertAlmostEqual(spans[0].dst_start, placed, delta=0.12)
+
+    def test_silence_does_not_outrank_the_phrase(self) -> None:
+        qry = harmonic(SR, 1.2, 440.0).astype(np.float64)
+        ref = np.zeros(int(6.0 * SR), dtype=np.float64)
+        at = int(2.5 * SR)
+        ref[at : at + len(qry)] = qry
+        lag, score, _ratio = waveform_ncc_offset(
+            ref, qry, sr=SR, max_lag_sec=5.0, finger_sec=2.0
+        )
+        self.assertLessEqual(score, 1.0)
+        self.assertGreater(score, 0.5)
+        self.assertAlmostEqual(lag, 2.5, delta=0.05)
+
+    def test_rest_entrance_beats_a_later_repeat(self) -> None:
+        """A phrase chained into a rest starts when the rest ends, not on a later copy."""
+        sr = 22050
+        phrase = harmonic(sr, 1.2, 220.0).astype(np.float32) * 0.8
+        repeat = harmonic(sr, 1.2, 220.0).astype(np.float32) * 0.8
+        lead = harmonic(sr, 1.0, 330.0).astype(np.float32) * 0.7
+        ref = np.zeros(int(30.0 * sr), dtype=np.float32)
+        ref[int(1.0 * sr) : int(1.0 * sr) + len(lead)] = lead
+        ref[int(10.0 * sr) : int(10.0 * sr) + len(phrase)] = phrase
+        ref[int(22.0 * sr) : int(22.0 * sr) + len(repeat)] = repeat
+        aca = np.zeros(int(8.0 * sr), dtype=np.float32)
+        aca[int(0.2 * sr) : int(0.2 * sr) + len(lead)] = lead
+        # File gap puts the chain inside the rest, before the real entrance.
+        aca[int(6.0 * sr) : int(6.0 * sr) + len(phrase)] = phrase
+        _src, dst, _notes = place_segments(aca, ref, sr=sr, prefer_wave=True)
+        self.assertGreaterEqual(len(dst), 2)
+        self.assertAlmostEqual(dst[-1][0], 10.0, delta=0.4)
+        self.assertLess(dst[-1][0], 12.0)
+
+    def test_snap_keeps_gradual_tempo_inserts(self) -> None:
+        """15–40 ms Mel/aca tempo steps must not flatten to the first pad."""
+        segs = [(0.0, 2.0), (2.5, 4.5), (5.0, 7.0), (7.5, 9.5)]
+        # Contiguous file gaps of 0.5 s; dest gaps grow by ~25 ms each (tempo).
+        placements = [
+            (2.578, 4.578, 0.8),
+            (5.103, 7.103, 0.8),  # insert +25 ms vs file_gap
+            (7.653, 9.653, 0.8),  # +25 ms again
+            (10.228, 12.228, 0.8),
+        ]
+        snapped, n = snap_tiny_inserts(segs, placements)
+        self.assertEqual(n, 0)
+        offsets = [p[0] - s[0] for s, p in zip(segs, snapped)]
+        self.assertAlmostEqual(offsets[0], 2.578, places=3)
+        self.assertAlmostEqual(offsets[-1], 2.728, places=3)
+        self.assertGreater(offsets[-1] - offsets[0], 0.10)
+
+    def test_snap_still_drops_micro_jitter(self) -> None:
+        segs = [(0.0, 2.0), (2.5, 4.5)]
+        placements = [(1.0, 3.0, 0.8), (3.508, 5.508, 0.8)]  # +8 ms insert
+        snapped, n = snap_tiny_inserts(segs, placements)
+        self.assertEqual(n, 1)
+        self.assertAlmostEqual(snapped[1][0], 3.5, places=3)
+
+    def test_gap_report_names_the_render_map(self) -> None:
+        row = combine_reports(
+            {
+                "map_type": "gap_spans",
+                "offset_sec": 0.123,
+                "drift": 0.0003,
+                "global_offset_sec": 0.123,
+                "global_drift": 0.0003,
+                "render_pad_sec": 0.0,
+                "phrase_start_offset": 0.0,
+                "times": [0.0, 1.0],
+                "lags": [0.0, 0.1],
+                "confidence": 0.8,
+                "failures": [],
+            },
+            {
+                "offset_sec": 0.01,
+                "drift": 0.0,
+                "times": [0.0],
+                "lags": [0.0],
+                "confidence": 0.9,
+                "failures": [],
+            },
+            profile="default",
+        )
+        self.assertEqual(row["map_type"], "gap_spans")
+        self.assertAlmostEqual(row["global_offset_sec"], 0.123)
+        self.assertAlmostEqual(row["render_pad_sec"], 0.0)
 
     def test_phrase_offset_is_applied_once(self) -> None:
         """Query 9.900–11.900 against reference 10.000–12.000 stays a +100 ms map."""

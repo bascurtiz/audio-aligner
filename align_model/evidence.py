@@ -180,6 +180,8 @@ def _frame_corr(
         ref = ref.reshape(1, -1)
         qry = qry.reshape(1, -1)
     n = min(ref.shape[1], qry.shape[1])
+    if n < 2:
+        return np.zeros(1), np.zeros(1)
     ref = ref[:, :n]
     qry = qry[:, :n]
     corr_sum = None
@@ -285,10 +287,15 @@ def extract_evidence(
     for start in range(0, max(1, frames - win), step):
         end = min(frames, start + win)
         considered += 1
+        # The stem can run past the reference. A window with no reference
+        # audio left has nothing to correlate.
+        rend = min(r_frames, end + ref_extra)
+        if end <= start or rend - start < 2:
+            dropped += 1
+            continue
         if float(np.mean(rms[start:end])) < rms_thr:
             dropped += 1
             continue
-        rend = min(r_frames, end + ref_extra)
         c_frames, c_vals = _frame_corr(chroma_r[:, start:rend], chroma_q[:, start:end], max_lag)
         c_lag, c_best, _c2_lag, c_second = best_and_second(c_vals, c_frames * hop_sec)
         o_frames, o_vals = _frame_corr(onset_r[start:rend], onset_q[start:end], max_lag)

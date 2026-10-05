@@ -14,6 +14,7 @@ Requires REAPER installed (uses bundled élastique). First-time tip:
 from __future__ import annotations
 
 import argparse
+import atexit
 import ctypes
 import json
 import os
@@ -37,9 +38,11 @@ from check_alignment import (
     DEFAULT_WEAK_WINDOW_FRAC,
     DEFAULT_WINDOW_CORR_MIN,
     analyze_alignment,
+    apply_full_score,
     apply_stem_check,
     plan_residual_repair,
     scan_folder,
+    score_rendered_pair,
     stem_verdicts,
 )
 from warp_align_fail_all import (
@@ -435,7 +438,228 @@ def _start_reaper_process(
     return _WinProcess(int(process_info.hProcess), int(process_info.dwProcessId))
 
 
+class _WarmReaper:
+    """One hidden REAPER instance that stays up between songs.
+
+    Cold ``-newinst`` pays process + plugin + project startup on every warp.
+    The warm worker loads once, then polls an inbox for job batches.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._job_lock = threading.Lock()
+        self._proc: _WinProcess | subprocess.Popen | None = None
+        self._inbox: Path | None = None
+        self._desktop_handle: int | None = None
+        self._hide_stop: threading.Event | None = None
+        self._hide_thread: threading.Thread | None = None
+        self._reaper_exe: Path | None = None
+
+    def shutdown(self, *, grace_sec: float = 8.0) -> None:
+        with self._lock:
+            self._shutdown_unlocked(grace_sec=grace_sec)
+
+    def _shutdown_unlocked(self, *, grace_sec: float = 8.0) -> None:
+        proc = self._proc
+        inbox = self._inbox
+        hide_stop = self._hide_stop
+        hide_thread = self._hide_thread
+        desktop_handle = self._desktop_handle
+        self._proc = None
+        self._inbox = None
+        self._hide_stop = None
+        self._hide_thread = None
+        self._desktop_handle = None
+        self._reaper_exe = None
+        if inbox is not None:
+            try:
+                (inbox / "quit").write_text("1\n", encoding="utf-8")
+            except OSError:
+                pass
+        if hide_stop is not None:
+            hide_stop.set()
+        if hide_thread is not None:
+            hide_thread.join(timeout=min(1.0, max(0.05, grace_sec)))
+        if proc is not None and proc.poll() is None:
+            try:
+                proc.wait(timeout=max(0.05, float(grace_sec)))
+            except Exception:
+                pass
+            if proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=min(1.0, max(0.2, float(grace_sec))))
+                except Exception:
+                    proc.kill()
+        close = getattr(proc, "close", None) if proc is not None else None
+        if close is not None:
+            close()
+        if desktop_handle and _user32 is not None:
+            _user32.CloseDesktop(desktop_handle)
+        if inbox is not None and inbox.is_dir():
+            shutil.rmtree(inbox, ignore_errors=True)
+
+    def _ensure_unlocked(self, reaper_exe: Path) -> Path:
+        """Start or reuse the warm worker. Caller must hold ``_lock``."""
+        reaper_exe = Path(reaper_exe)
+        if (
+            self._proc is not None
+            and self._inbox is not None
+            and self._reaper_exe == reaper_exe
+            and self._proc.poll() is None
+            and (self._inbox / "ready").is_file()
+        ):
+            return self._inbox
+        self._shutdown_unlocked()
+        if not LUA_WORKER.is_file():
+            raise FileNotFoundError(f"Missing Lua worker: {LUA_WORKER}")
+        inbox = Path(tempfile.mkdtemp(prefix="align_reaper_warm_"))
+        for name in ("job.json", "job.json.done", "job.json.error", "job.busy", "quit", "ready"):
+            path = inbox / name
+            if path.exists():
+                path.unlink()
+        env = os.environ.copy()
+        env["ALIGN_CHECKER_REAPER_INBOX"] = str(inbox)
+        env.pop("ALIGN_CHECKER_REAPER_JOB", None)
+        cmd = [str(reaper_exe), "-nosplash", "-newinst", str(LUA_WORKER)]
+        hidden = _open_hidden_desktop()
+        desktop_handle = hidden[0] if hidden else None
+        desktop_name = hidden[1] if hidden else None
+        proc = _start_reaper_process(cmd, env, desktop_name)
+        hide_stop = threading.Event()
+        hide_thread = threading.Thread(
+            target=_keep_reaper_hidden,
+            args=(proc, hide_stop),
+            daemon=True,
+        )
+        hide_thread.start()
+        self._proc = proc
+        self._inbox = inbox
+        self._desktop_handle = desktop_handle
+        self._hide_stop = hide_stop
+        self._hide_thread = hide_thread
+        self._reaper_exe = reaper_exe
+        ready = inbox / "ready"
+        deadline = time.time() + 90.0
+        while time.time() < deadline:
+            if proc.poll() is not None:
+                code = proc.returncode
+                self._shutdown_unlocked()
+                raise RuntimeError(f"Warm REAPER exited before ready (code {code})")
+            if ready.is_file():
+                return inbox
+            time.sleep(0.05)
+        self._shutdown_unlocked()
+        raise TimeoutError("Warm REAPER did not become ready")
+
+    def run_jobs(
+        self,
+        reaper_exe: Path,
+        jobs: list[dict],
+        *,
+        timeout_sec: float,
+        expected_outputs: list[Path] | None,
+    ) -> None:
+        with self._job_lock:
+            with self._lock:
+                inbox = self._ensure_unlocked(reaper_exe)
+                job_path = inbox / "job.json"
+                done_path = Path(str(job_path) + ".done")
+                err_path = Path(str(job_path) + ".error")
+                busy_path = inbox / "job.busy"
+                for path in (done_path, err_path, busy_path, job_path):
+                    if path.exists():
+                        path.unlink()
+                partial = inbox / "job.json.partial"
+                partial.write_text(json.dumps({"jobs": jobs}, indent=2), encoding="utf-8")
+                partial.replace(job_path)
+                proc = self._proc
+            deadline = time.time() + timeout_sec * max(1, len(jobs))
+            while time.time() < deadline:
+                if err_path.is_file():
+                    msg = err_path.read_text(encoding="utf-8", errors="replace")
+                    raise RuntimeError(f"REAPER worker failed: {msg.strip()}")
+                if done_path.is_file():
+                    time.sleep(0.35)
+                    break
+                if proc is not None and proc.poll() is not None:
+                    time.sleep(0.35)
+                    if err_path.is_file():
+                        msg = err_path.read_text(encoding="utf-8", errors="replace")
+                        raise RuntimeError(f"REAPER worker failed: {msg.strip()}")
+                    if done_path.is_file():
+                        break
+                    raise RuntimeError(
+                        f"Warm REAPER exited early (code {proc.returncode}) without .done"
+                    )
+                time.sleep(0.2)
+            else:
+                raise TimeoutError(f"REAPER job timed out after {timeout_sec}s")
+            if expected_outputs:
+                missing = [p for p in expected_outputs if not p.is_file()]
+                if missing:
+                    parent = missing[0].parent
+                    listing = ", ".join(x.name for x in parent.glob("*")) or "(empty)"
+                    raise FileNotFoundError(
+                        f"REAPER finished but output missing: {missing[0].name}. "
+                        f"Temp dir contains: {listing}"
+                    )
+
+
+_WARM_REAPER = _WarmReaper()
+atexit.register(lambda: _WARM_REAPER.shutdown())
+
+
+def shutdown_warm_reaper(*, grace_sec: float = 8.0) -> None:
+    """Stop the shared REAPER worker. Safe to call more than once.
+
+    ``grace_sec`` is how long to wait for a polite quit before terminate.
+    App close should pass a short value so the window can disappear promptly.
+    """
+    _WARM_REAPER.shutdown(grace_sec=grace_sec)
+
+
 def run_reaper_jobs(
+    reaper_exe: Path,
+    jobs: list[dict],
+    *,
+    timeout_sec: float = 600.0,
+    expected_outputs: list[Path] | None = None,
+) -> None:
+    if not LUA_WORKER.is_file():
+        raise FileNotFoundError(f"Missing Lua worker: {LUA_WORKER}")
+    if not jobs:
+        return
+    # ALIGN_CHECKER_REAPER_COLD=1 keeps the old one-shot process for debugging.
+    if os.environ.get("ALIGN_CHECKER_REAPER_COLD", "").strip() not in ("", "0", "false", "False"):
+        _run_reaper_jobs_cold(
+            reaper_exe, jobs, timeout_sec=timeout_sec, expected_outputs=expected_outputs
+        )
+        return
+    try:
+        _WARM_REAPER.run_jobs(
+            reaper_exe,
+            jobs,
+            timeout_sec=timeout_sec,
+            expected_outputs=expected_outputs,
+        )
+        return
+    except RuntimeError as exc:
+        text = str(exc)
+        if text.startswith("REAPER worker failed:"):
+            raise
+        if "exited" not in text.lower() and "ready" not in text.lower():
+            raise
+    except TimeoutError as exc:
+        if "ready" not in str(exc).lower():
+            raise
+    shutdown_warm_reaper()
+    _run_reaper_jobs_cold(
+        reaper_exe, jobs, timeout_sec=timeout_sec, expected_outputs=expected_outputs
+    )
+
+
+def _run_reaper_jobs_cold(
     reaper_exe: Path,
     jobs: list[dict],
     *,
@@ -458,6 +682,7 @@ def run_reaper_jobs(
 
         env = os.environ.copy()
         env["ALIGN_CHECKER_REAPER_JOB"] = str(job_path)
+        env.pop("ALIGN_CHECKER_REAPER_INBOX", None)
 
         # -newinst so an already-open REAPER is not brought forward.
         # The worker runs on a desktop that is never shown.
@@ -969,29 +1194,7 @@ def _scored_edit_row(folder: Path, notes: list[str], on_step, *, tag_folder: boo
             "notes": "; ".join(notes),
         }
     _emit_step(on_step, "score")
-    verdict, corr, _lag, drift, _weak, check_notes = analyze_alignment(
-        aca,
-        inst,
-        orig2,
-        corr_min=DEFAULT_CORR_MIN,
-        drift_ms=DEFAULT_DRIFT_MS,
-        window_corr_min=DEFAULT_WINDOW_CORR_MIN,
-        weak_window_frac=DEFAULT_WEAK_WINDOW_FRAC,
-    )
-    (
-        aca_verdict,
-        inst_verdict,
-        combined,
-        _aca_corr,
-        _inst_corr,
-        _aca_drift,
-        _inst_drift,
-        aca_lag,
-        inst_lag,
-        stem_notes,
-        aca_points,
-        inst_points,
-    ) = stem_verdicts(
+    scored = score_rendered_pair(
         aca,
         inst,
         orig2,
@@ -1001,6 +1204,20 @@ def _scored_edit_row(folder: Path, notes: list[str], on_step, *, tag_folder: boo
         window_corr_min=DEFAULT_WINDOW_CORR_MIN,
         weak_window_frac=DEFAULT_WEAK_WINDOW_FRAC,
     )
+    mix = scored["mix"]
+    stem = scored["stem"]
+    verdict = mix["verdict"]
+    corr = mix["corr"]
+    drift = mix["drift_ms"]
+    check_notes = mix["notes"]
+    aca_verdict = stem["aca_verdict"]
+    inst_verdict = stem["inst_verdict"]
+    combined = stem["combined"]
+    aca_lag = stem["aca_lag"]
+    inst_lag = stem["inst_lag"]
+    stem_notes = stem["notes"]
+    aca_points = stem["aca_checkpoints"]
+    inst_points = stem["inst_checkpoints"]
     notes.append(stem_notes)
     notes.append(f"check={verdict} corr={corr:.3f} drift={drift:.1f}ms; {check_notes}")
     live = folder
@@ -1303,11 +1520,21 @@ def _process_folder_model(
     try:
         from demucs_vocals import load_instrumental_mono, load_vocals_mono
 
-        repair_note = _repair_rendered_stems(
-            [
+        # Gap-aware aca already sits on Mel phrase attacks. A global residual
+        # warp keyed off second-half spikes re-delays a good first half
+        # (Groove Thang ~50 ms late at 0:48). Only repair the instrumental.
+        repair_jobs: list[tuple[str, Path, np.ndarray]] = [
+            ("inst", inst_dest, load_instrumental_mono(orig, SR_ANALYSIS, folder=folder)),
+        ]
+        if not gaps_cut:
+            repair_jobs.insert(
+                0,
                 ("aca", aca_dest, load_vocals_mono(orig, SR_ANALYSIS, folder=folder)),
-                ("inst", inst_dest, load_instrumental_mono(orig, SR_ANALYSIS, folder=folder)),
-            ],
+            )
+        else:
+            result.notes += "; aca_repair=skip_gaps"
+        repair_note = _repair_rendered_stems(
+            repair_jobs,
             reaper_exe=reaper_exe,
             target_sr=info.samplerate,
             target_frames=info.frames,
@@ -1333,6 +1560,8 @@ def _process_folder_model(
     except Exception as exc:  # noqa: BLE001
         result.notes += f"; loudness_match_skip:{type(exc).__name__}:{exc}"
 
+    # De-click under LOUDNESS (after gain) so that step absorbs RX time; score
+    # stays on the alignment check only. Order still: gain → de-click → score.
     _apply_aca_declick(aca_dest, declick_plan.method, reaper_exe)
     _emit_step(on_step, "score")
     aca, inst, orig2, scan_notes = scan_folder(folder)
@@ -1340,37 +1569,9 @@ def _process_folder_model(
         result.verdict = "error"
         result.notes += f"; post_scan:{scan_notes}"
         return
-    from align_model.quality import post_render_validation
+    from align_model.quality import stamp_result
 
-    checked = post_render_validation(
-        aca,
-        inst,
-        orig2,
-        corr_min=corr_min,
-        drift_ms=drift_ms,
-        window_corr_min=window_corr_min,
-        weak_window_frac=weak_window_frac,
-    )
-    mix_verdict, corr, lag, drift, notes = (
-        checked["verdict"],
-        checked["corr"],
-        checked["lag_sec"],
-        checked["drift_ms"],
-        checked["notes"],
-    )
-    if isinstance(result.alignment_report, dict):
-        result.alignment_report["validation"] = "post_render"
-        result.alignment_report["post_render"] = {
-            "verdict": mix_verdict,
-            "corr": corr,
-            "lag_sec": lag,
-            "drift_ms": drift,
-        }
-    result.corr = corr
-    result.lag_sec = lag
-    result.drift_ms = drift
-    result.notes += f"; {notes}"
-    apply_stem_check(
+    mix = apply_full_score(
         result,
         aca,
         inst,
@@ -1381,6 +1582,20 @@ def _process_folder_model(
         window_corr_min=window_corr_min,
         weak_window_frac=weak_window_frac,
     )
+    mix_verdict, corr, lag, drift = (
+        mix["verdict"],
+        mix["corr"],
+        mix["lag_sec"],
+        mix["drift_ms"],
+    )
+    if isinstance(result.alignment_report, dict):
+        result.alignment_report["validation"] = "post_render"
+        result.alignment_report["post_render"] = {
+            "verdict": mix_verdict,
+            "corr": corr,
+            "lag_sec": lag,
+            "drift_ms": drift,
+        }
     stamp_result(result, mix_verdict=mix_verdict, mix_corr=corr, mix_lag=lag, mix_drift=drift)
     if move_on_pass and result.verdict in ("pass", "fail"):
         _emit_step(on_step, "tag")
@@ -1633,15 +1848,22 @@ def process_folder(
         try:
             from demucs_vocals import load_instrumental_mono, load_vocals_mono
 
-            repair_note = _repair_rendered_stems(
-                [
+            repair_jobs: list[tuple[str, Path, np.ndarray]] = [
+                (
+                    "inst",
+                    inst_dest,
+                    load_instrumental_mono(orig, SR_ANALYSIS, folder=folder),
+                ),
+            ]
+            if not gaps_cut:
+                repair_jobs.insert(
+                    0,
                     ("aca", aca_dest, load_vocals_mono(orig, SR_ANALYSIS, folder=folder)),
-                    (
-                        "inst",
-                        inst_dest,
-                        load_instrumental_mono(orig, SR_ANALYSIS, folder=folder),
-                    ),
-                ],
+                )
+            else:
+                result.notes += "; aca_repair=skip_gaps"
+            repair_note = _repair_rendered_stems(
+                repair_jobs,
                 reaper_exe=reaper_exe,
                 target_sr=info.samplerate,
                 target_frames=info.frames,
@@ -1672,9 +1894,9 @@ def process_folder(
         except Exception as exc:  # noqa: BLE001
             result.notes += f"; loudness_match_skip:{type(exc).__name__}:{exc}"
 
-        # After the gain. A click removed first would be raised again with the vocal.
+        # De-click under LOUDNESS (after gain) so that step absorbs RX time; score
+        # stays on the alignment check only. Order still: gain → de-click → score.
         _apply_aca_declick(aca_dest, declick_plan.method, reaper_exe)
-
         _emit_step(on_step, "score")
         aca, inst, orig2, scan_notes = scan_folder(folder)
         if not aca or not inst or not orig2:
@@ -1682,20 +1904,7 @@ def process_folder(
             result.notes += f"; post_scan:{scan_notes}"
             return result
 
-        _verdict, corr, lag, drift, _weak, notes = analyze_alignment(
-            aca,
-            inst,
-            orig2,
-            corr_min=corr_min,
-            drift_ms=drift_ms,
-            window_corr_min=window_corr_min,
-            weak_window_frac=weak_window_frac,
-        )
-        result.corr = corr
-        result.lag_sec = lag
-        result.drift_ms = drift
-        result.notes += f"; {notes}"
-        apply_stem_check(
+        apply_full_score(
             result,
             aca,
             inst,
@@ -1743,8 +1952,8 @@ def main() -> int:
         "--use-demucs-vocals",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="Place the acapella on Demucs vocals and warp the instrumental to the "
-        "Demucs instrumental. Pass --no-use-demucs-vocals to use the full mix instead.",
+        help="Place the acapella on the Mel-Band vocal and warp the instrumental to the "
+        "Mel-Band instrumental. Pass --no-use-demucs-vocals to use the full mix instead.",
     )
     ap.add_argument(
         "--declick",
@@ -1771,6 +1980,7 @@ def main() -> int:
 
     reaper_exe = find_reaper(args.reaper_exe)
     declick_plan = resolve_declick(args.declick, host_rx=True)
+    print("Reference: Mel-Band RoFormer")
     print(f"REAPER: {reaper_exe}")
     print(f"De-click: {declick_plan.summary}")
     print(f"Lua:    {LUA_WORKER}")

@@ -34,10 +34,11 @@ COLORS = {
     "done": "#7c5cff",
     "active": "#9077ff",
     "score": "#60A5FA",  # instrumental blue (tag)
-    "final": "#7ee0a0",  # pass green (score / align)
+    "final": "#3D9E8F",  # align animation green
+    "score_ok": "#6FC38C",  # score animation green
     "acapella": "#a855f7",  # player acapella purple (scan)
     "facebook": "#1877F2",  # Demucs
-    "silence": "#C8CCD8",  # light gray
+    "silence": "#3d6f8f",  # same blue-gray as lag-map gap bands
     "beat": "#ecc990",  # master clock
     "loudness": "#ff7a7a",  # same red as a fail verdict
     "icon_mute": "#555866",
@@ -61,19 +62,19 @@ def format_eta(seconds: float | None) -> str:
 
 # (step_id, short label, headline while active)
 ALIGN_STEPS: list[tuple[str, str, str]] = [
-    ("demucs", "SPLIT", "Preparing Demucs vocal and instrumental"),
+    ("demucs", "SPLIT", "Preparing Mel-Band vocal and instrumental"),
     ("silence", "SILENCE", "Putting rests back in the acapella"),
-    ("align", "ALIGN", "Stretching both stems to the Demucs splits"),
-    ("loudness", "LOUDNESS", "Matching loudness to the Demucs splits"),
+    ("align", "ALIGN", "Stretching both stems to the Mel-Band splits"),
+    ("loudness", "LOUDNESS", "Matching loudness to the Mel-Band splits"),
     ("score", "SCORE", "Scoring alignment"),
 ]
 
 def edit_steps(stem: str) -> list[tuple[str, str, str]]:
     """Headlines for a section edit. ``stem`` is ``aca`` or ``inst``."""
     if stem == "inst":
-        name, ref = "instrumental", "Demucs instrumental"
+        name, ref = "instrumental", "Mel-Band instrumental"
     else:
-        name, ref = "acapella", "Demucs vocal"
+        name, ref = "acapella", "Mel-Band vocal"
     return [
         ("write", "WRITE", f"Writing the edited {name}"),
         ("align", "ALIGN", f"Warping the {name} to the {ref}"),
@@ -96,12 +97,12 @@ def _step_color(step_id: str, *, is_last: bool) -> str:
     by_id = {
         "scan": COLORS["acapella"],
         "write": COLORS["silence"],
-        "score": COLORS["final"],
+        "score": COLORS["score_ok"],
         "tag": COLORS["score"],
-        "demucs": COLORS["facebook"],
+        "demucs": COLORS["accent"],
         "beat": COLORS["beat"],
         "silence": COLORS["silence"],
-        "align": COLORS["final"],
+        "align": COLORS["beat"],
         "loudness": COLORS["loudness"],
     }
     if step_id in by_id:
@@ -129,6 +130,17 @@ def _pen(color: str, width: float, alpha: int = 255) -> QPen:
     pen.setCapStyle(Qt.PenCapStyle.RoundCap)
     pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
     return pen
+
+
+def _mix_color(a: str, b: str, t: float) -> str:
+    """Linear RGB mix. ``t`` 0 → ``a``, 1 → ``b``."""
+    t = max(0.0, min(1.0, float(t)))
+    ca, cb = QColor(a), QColor(b)
+    return QColor(
+        int(ca.red() + (cb.red() - ca.red()) * t),
+        int(ca.green() + (cb.green() - ca.green()) * t),
+        int(ca.blue() + (cb.blue() - ca.blue()) * t),
+    ).name()
 
 
 def _draw_bars(
@@ -205,7 +217,7 @@ class _ProcessGlyph(QWidget):
         return _step_color(self._step_id, is_last=False)
 
     def _muted(self) -> str:
-        return COLORS["icon_mute"] if self._state == "pending" else COLORS["fg_dim"]
+        return COLORS["icon_mute"] if self._state == "pending" else "#D6DAE8"
 
     def _paint_tile(self, p: QPainter) -> None:
         rect = QRectF(0.5, 0.5, self.width() - 1.0, self.height() - 1.0)
@@ -225,14 +237,22 @@ class _ProcessGlyph(QWidget):
         t = self._t
         s = float(self.width())
         cx = cy = s / 2
-        accent = self._accent()
-        inst = self._muted() if self._state == "pending" else COLORS["score"]
+        mute = self._muted()
+        # One accent waveform first (same purple as the step rule), then peel
+        # into vocal purple / instrumental blue.
+        if self._state == "pending":
+            aca = inst = mute
+        else:
+            base = self._accent()
+            peel = min(1.0, max(0.0, (t - 0.06) / 0.40))
+            aca = _mix_color(base, COLORS["acapella"], peel)
+            inst = _mix_color(base, COLORS["score"], peel)
         lift = 18.0 * t
         _draw_bars(p, inst, cx, cy + lift, _SPLIT_AMPS, 7.0, 15, width=2.3)
-        _draw_bars(p, accent, cx, cy - lift, _SPLIT_AMPS, 7.0, 15, width=2.3)
+        _draw_bars(p, aca, cx, cy - lift, _SPLIT_AMPS, 7.0, 15, width=2.3)
         if t > 0.18:
             alpha = int(230 * min(1.0, (t - 0.18) / 0.55))
-            p.setPen(_pen(accent, 2.15, alpha))
+            p.setPen(_pen(mute, 2.15, alpha))
             reach = 14.0 + lift
             p.drawLine(QPointF(cx + 18, cy - reach), QPointF(cx - 18, cy + reach))
 
@@ -259,13 +279,14 @@ class _ProcessGlyph(QWidget):
         t = self._t
         s = float(self.width())
         cx = cy = s / 2
-        color = self._accent()
+        bars = self._muted()
+        line = self._accent()
         shift = 10.0 * t
-        _draw_bars(p, color, cx - 8 - shift, cy, _SILENCE_LEFT, 6.2, 24)
-        _draw_bars(p, color, cx + 8 + shift, cy, _SILENCE_RIGHT, 6.2, 24)
+        _draw_bars(p, bars, cx - 8 - shift, cy, _SILENCE_LEFT, 6.2, 24)
+        _draw_bars(p, bars, cx + 8 + shift, cy, _SILENCE_RIGHT, 6.2, 24)
         if t > 0.12:
             alpha = int(240 * min(1.0, (t - 0.12) / 0.45))
-            p.setPen(_pen(color, 2.15, alpha))
+            p.setPen(_pen(line, 2.15, alpha))
             half = 2.0 + 8.0 * t
             p.drawLine(QPointF(cx - half, cy), QPointF(cx + half, cy))
 
@@ -273,14 +294,14 @@ class _ProcessGlyph(QWidget):
         t = self._t
         s = float(self.width())
         cx = s / 2
-        accent = self._accent()
-        ref = self._muted()
+        top = self._accent()
+        moving = self._muted()
         spacing = 6.5
-        _draw_bars(p, ref, cx, s * 0.36, _ALIGN_AMPS, spacing, 16, width=2.2)
+        _draw_bars(p, top, cx, s * 0.36, _ALIGN_AMPS, spacing, 16, width=2.2)
         moving_spacing = spacing * (1.0 + 0.22 * (1.0 - t))
         _draw_bars(
             p,
-            accent,
+            moving,
             cx + (1.0 - t) * 12.0,
             s * 0.66,
             _ALIGN_AMPS,
@@ -293,18 +314,18 @@ class _ProcessGlyph(QWidget):
         s = float(self.width())
         cx = s / 2
         accent = self._accent()
-        line = self._muted() if self._state == "pending" else "#ffb0b0"
+        guide = self._muted()
         baseline = s * 0.74
         max_h = 38.0
         spacing = 8.0
         target_y = baseline - _LOUD_TARGET * max_h
-        p.setPen(_pen(line, 1.35))
+        p.setPen(_pen(guide, 1.35))
         pen = p.pen()
         pen.setStyle(Qt.PenStyle.CustomDashLine)
         pen.setDashPattern([1.6, 2.4])
         p.setPen(pen)
         p.drawLine(QPointF(16, target_y), QPointF(s - 18, target_y))
-        p.setPen(_pen(line, 1.35))
+        p.setPen(_pen(guide, 1.35))
         p.drawLine(QPointF(s - 18, target_y - 3.5), QPointF(s - 18, target_y + 3.5))
 
         p.setPen(_pen(accent, 3.0))

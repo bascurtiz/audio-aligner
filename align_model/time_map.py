@@ -164,8 +164,16 @@ def solve_constrained_lag_path(
                 beats=beats,
                 downbeats=downbeats,
             )
-            pull[i] = snapped
-            beat_w[i] = beat_weight * mult * (1.0 - 0.5 * float(scores[i]))
+            # A snap of more than 20 ms is a different beat, not a phase trim.
+            # The audio lag already sits on the robust line (MaMaSé instrumental:
+            # 9 s early, 11 s late, and the 1:31 section 55 ms early).
+            if abs(snapped - float(line[i])) <= 0.02:
+                pull[i] = snapped
+                beat_w[i] = beat_weight * mult * (1.0 - 0.5 * float(scores[i]))
+            elif float(conf[i]) < medium_conf:
+                pull[i] = float(line[i])
+            else:
+                pull[i] = float(target[i])
         else:
             pull[i] = float(line[i]) if float(conf[i]) < medium_conf else target[i]
 
@@ -294,8 +302,15 @@ def _clamp_accel(times: np.ndarray, lags: np.ndarray, max_step: float) -> tuple[
             n_modified += 1
     src_out = np.empty_like(src)
     src_out[0] = src[0]
+    # Open-loop integration of a clamped rate walks the lag for the rest of
+    # the file. Leak the rebuilt source back onto the solved source so a
+    # corner is rounded and the offset then returns.
+    restore = 1.5
     for i, rate in enumerate(rates):
-        src_out[i + 1] = src_out[i] + float(rate) * float(t[i + 1] - t[i])
+        dt = float(t[i + 1] - t[i])
+        stepped = float(src_out[i]) + float(rate) * dt
+        leak = min(1.0, max(dt, 0.0) / restore)
+        src_out[i + 1] = stepped + leak * (float(src[i + 1]) - stepped)
     for i in range(1, len(src_out)):
         if abs(float(lag[i] - lag[i - 1])) >= 0.04:
             src_out[i] = src[i]
@@ -357,7 +372,14 @@ def adaptive_marker_times(
         acc += float(d2[i]) * float(t[i] - t[i - 1]) * float(conf[i])
         span = float(t[i] - last)
         near_jump = any(abs(float(t[i]) - jt) <= 0.75 for jt in jumps)
-        if span >= max_spacing or (span >= min_spacing and (acc >= thresh or near_jump)):
+        # A real step has to be pinned even when it sits closer than the
+        # usual marker spacing, or the stretch averages across it.
+        if near_jump and span >= 0.20:
+            marks.append(float(t[i]))
+            last = float(t[i])
+            acc = 0.0
+            continue
+        if span >= max_spacing or (span >= min_spacing and acc >= thresh):
             marks.append(float(t[i]))
             last = float(t[i])
             acc = 0.0
@@ -403,6 +425,11 @@ def src_dst_from_lags(
         jump_times=jump_times,
         scores=scores,
     )
+    if jump_times:
+        extra = np.asarray(jump_times, dtype=float).reshape(-1)
+        extra = extra[(extra >= -1e-6) & (extra <= target_sec + 1e-6)]
+        if extra.size:
+            dst = np.unique(np.concatenate([np.asarray(dst, dtype=float), extra]))
     dst = dst[(dst >= -1e-6) & (dst <= target_sec + 1e-6)]
     if len(dst) == 0 or dst[0] > 1e-4:
         dst = np.insert(dst, 0, 0.0)
@@ -435,6 +462,369 @@ def source_on_padded_wav(src: np.ndarray, pad_sec: float) -> np.ndarray:
     return np.asarray(src, dtype=float) + float(pad_sec)
 
 
+def refine_lags_with_envelope(
+    ref: np.ndarray | None,
+    qry: np.ndarray | None,
+    sr: int,
+    times: np.ndarray,
+    lags: np.ndarray,
+    *,
+    search_sec: float = 0.06,
+    win_sec: float = 0.40,
+    min_gain: float = 0.20,
+    min_score: float = 0.70,
+) -> np.ndarray:
+    """Nudge a solved lag onto the short envelope, within ±60 ms.
+
+    An 8 s feature window can sit a few tens of milliseconds off a hit the
+    waveform shows immediately. The search stays inside one beat, and a lag
+    moves only when the short envelope matches clearly better there.
+    """
+    lags = np.asarray(lags, dtype=float).reshape(-1).copy()
+    times = np.asarray(times, dtype=float).reshape(-1)
+    if (
+        ref is None
+        or qry is None
+        or sr <= 0
+        or len(times) < 2
+        or len(times) != len(lags)
+        or len(ref) < int(sr)
+        or len(qry) < int(sr)
+    ):
+        return lags
+    hop = 32
+    def _env(y: np.ndarray) -> np.ndarray | None:
+        y = np.asarray(y, dtype=np.float32).reshape(-1)
+        n = len(y) // hop
+        if n < 8:
+            return None
+        block = y[: n * hop].reshape(n, hop)
+        return np.sqrt(np.mean(block * block, axis=1))
+
+    er = _env(ref)
+    eq = _env(qry)
+    if er is None or eq is None:
+        return lags
+    env_sr = float(sr) / hop
+    win = max(8, int(round(win_sec * env_sr)))
+    search = max(1, int(round(search_sec * env_sr)))
+    for i, t in enumerate(times):
+        t = float(t)
+        a = int(round(t * env_sr))
+        b = a + win
+        if a < 0 or b > len(er):
+            continue
+        block = er[a:b].astype(np.float64)
+        block -= float(np.mean(block))
+        norm_r = float(np.linalg.norm(block))
+        if norm_r < 1e-6:
+            continue
+        qa0 = int(round((t - float(lags[i])) * env_sr))
+        current = -1.0
+        best = -1.0
+        best_delta = 0.0
+        for step in range(-search, search + 1):
+            qa = qa0 + step
+            qb = qa + win
+            if qa < 0 or qb > len(eq):
+                continue
+            other = eq[qa:qb].astype(np.float64)
+            other -= float(np.mean(other))
+            norm_q = float(np.linalg.norm(other))
+            if norm_q < 1e-6:
+                continue
+            score = float(np.dot(block, other) / (norm_r * norm_q))
+            if step == 0:
+                current = score
+            if score > best:
+                best = score
+                best_delta = -step / env_sr
+        if current < 0.0:
+            continue
+        if best >= min_score and best >= current + min_gain:
+            lags[i] = float(lags[i]) + best_delta
+    return lags
+
+
+def pull_unmatched_phrase(
+    ref: np.ndarray | None,
+    qry: np.ndarray | None,
+    sr: int,
+    times: np.ndarray,
+    lags: np.ndarray,
+) -> np.ndarray:
+    """Pull a phrase whose envelope is plainly late or early, then rejoin the solved path.
+
+    An 8 s feature window can lock the body of a song and leave the phrase
+    before it a few tenths of a second off. A 1.5 s envelope sees that
+    offset. The move is applied only where several windows agree, the
+    current score is near zero, and a later window is already matched, so
+    the rest of the path stays put.
+    """
+    lags = np.asarray(lags, dtype=float).reshape(-1).copy()
+    times = np.asarray(times, dtype=float).reshape(-1)
+    if (
+        ref is None
+        or qry is None
+        or sr <= 0
+        or len(times) < 4
+        or len(times) != len(lags)
+        or len(ref) < int(sr)
+        or len(qry) < int(sr)
+    ):
+        return lags
+    hop = 32
+    win_sec = 1.5
+    search_sec = 0.40
+
+    def _env(y: np.ndarray) -> np.ndarray | None:
+        y = np.asarray(y, dtype=np.float32).reshape(-1)
+        n = len(y) // hop
+        if n < 8:
+            return None
+        block = y[: n * hop].reshape(n, hop)
+        return np.sqrt(np.mean(block * block, axis=1))
+
+    er = _env(ref)
+    eq = _env(qry)
+    if er is None or eq is None:
+        return lags
+    env_sr = float(sr) / hop
+    win = max(8, int(round(win_sec * env_sr)))
+    search = max(1, int(round(search_sec * env_sr)))
+    step = 4
+
+    def _at(t: float, lag: float) -> tuple[float, float, float]:
+        """Return current score, lag delta, and score at that delta."""
+        a = int(round(t * env_sr))
+        b = a + win
+        if a < 0 or b > len(er):
+            return -1.0, 0.0, -1.0
+        block = er[a:b].astype(np.float64)
+        block -= float(np.mean(block))
+        norm_r = float(np.linalg.norm(block))
+        if norm_r < 1e-6:
+            return -1.0, 0.0, -1.0
+        base = int(round((t - lag) * env_sr))
+        current = -1.0
+        best = -1.0
+        best_delta = 0.0
+        best_step = 0
+        for s in range(-search, search + 1, step):
+            qa = base + s
+            qb = qa + win
+            if qa < 0 or qb > len(eq):
+                continue
+            other = eq[qa:qb].astype(np.float64)
+            other -= float(np.mean(other))
+            norm_q = float(np.linalg.norm(other))
+            if norm_q < 1e-6:
+                continue
+            score = float(np.dot(block, other) / (norm_r * norm_q))
+            if s == 0:
+                current = score
+            if score > best:
+                best = score
+                best_step = s
+                best_delta = -s / env_sr
+        if abs(best_step) >= search - step:
+            return current, 0.0, best
+        return current, best_delta, best
+
+    scored = [_at(float(t), float(lag)) for t, lag in zip(times, lags)]
+    eligible = []
+    for current, delta, best in scored:
+        ok = (
+            current < 0.10
+            and best >= 0.30
+            and best >= current + 0.22
+            and 0.12 <= abs(delta) <= 0.38
+        )
+        eligible.append(ok)
+
+    i = 0
+    n = len(times)
+    while i < n:
+        if not eligible[i]:
+            i += 1
+            continue
+        delta0 = scored[i][1]
+        j = i + 1
+        while j < n and eligible[j] and abs(scored[j][1] - delta0) <= 0.08:
+            j += 1
+        if j - i < 2:
+            i = j
+            continue
+        delta = float(np.median([scored[k][1] for k in range(i, j)]))
+        end = j
+        limit_t = float(times[j - 1]) + 6.0
+        while end < n and float(times[end]) <= limit_t:
+            if scored[end][0] >= 0.50:
+                break
+            end += 1
+        else:
+            i = j
+            continue
+        # The window that agreed looks past its own marker, so the hit
+        # itself is a little later than the last agreeing time.
+        hold_until = float(times[j - 1]) + win_sec
+        last_full = j - 1
+        for k in range(i, end):
+            if float(times[k]) <= hold_until:
+                lags[k] = float(lags[k]) + delta
+                last_full = k
+        t0 = float(times[last_full])
+        t1 = float(times[end])
+        span = max(t1 - t0, 1e-3)
+        for k in range(last_full + 1, end):
+            frac = max(0.0, 1.0 - (float(times[k]) - t0) / span)
+            lags[k] = float(lags[k]) + delta * frac
+        i = end
+    return _monotonic_lag(times, lags)
+
+
+def _envelope(y: np.ndarray, sr: int, hop_sec: float = 0.01) -> tuple[np.ndarray, float]:
+    hop = max(1, int(round(hop_sec * sr)))
+    n = len(y) // hop
+    if n < 4:
+        return np.zeros(0, dtype=np.float64), hop / float(sr)
+    block = np.asarray(y[: n * hop], dtype=np.float64).reshape(n, hop)
+    return np.sqrt(np.mean(block * block, axis=1)), hop / float(sr)
+
+
+def _silence_runs(env: np.ndarray, hop_sec: float, thr: float, min_sec: float) -> list[tuple[float, float]]:
+    runs: list[tuple[float, float]] = []
+    start = None
+    for i, value in enumerate(env):
+        if value < thr:
+            if start is None:
+                start = i
+            continue
+        if start is not None:
+            if (i - start) * hop_sec >= min_sec and start > 0:
+                runs.append((start * hop_sec, i * hop_sec))
+            start = None
+    return runs
+
+
+def _dst_for_source(times: np.ndarray, lags: np.ndarray, source: float) -> float:
+    grid = np.arange(float(times[0]), float(times[-1]) + 0.01, 0.01)
+    if grid.size < 2:
+        return float(times[0])
+    pos = grid - np.interp(grid, times, lags)
+    return float(grid[int(np.argmin(np.abs(pos - source)))])
+
+
+def _put_lag(times: np.ndarray, lags: np.ndarray, at: float, lag: float) -> tuple[np.ndarray, np.ndarray]:
+    times = np.asarray(times, dtype=float).copy()
+    lags = np.asarray(lags, dtype=float).copy()
+    near = int(np.argmin(np.abs(times - at)))
+    if abs(float(times[near]) - at) <= 0.03:
+        lags[near] = lag
+        return times, lags
+    times = np.concatenate([times, [at]])
+    lags = np.concatenate([lags, [lag]])
+    order = np.argsort(times)
+    return times[order], lags[order]
+
+
+def fit_reference_gaps(
+    ref: np.ndarray | None,
+    qry: np.ndarray | None,
+    sr: int,
+    times: np.ndarray,
+    lags: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, list[float]]:
+    """Stretch a short query silence so it covers the reference silence before a hit.
+
+    The hit after the gap already matches. The phrase before it is still
+    running when the reference has gone quiet, so the gap in the output is
+    the short one from the stem. The phrase eases earlier until its own
+    silence starts with the reference, and the hit stays where it is.
+    """
+    times = np.asarray(times, dtype=float).reshape(-1).copy()
+    lags = np.asarray(lags, dtype=float).reshape(-1).copy()
+    empty: list[float] = []
+    if (
+        ref is None
+        or qry is None
+        or sr <= 0
+        or len(times) < 4
+        or len(times) != len(lags)
+        or len(ref) < int(sr)
+        or len(qry) < int(sr)
+    ):
+        return times, lags, empty
+    ref_e, hop = _envelope(ref, sr)
+    qry_e, _hop = _envelope(qry, sr)
+    if ref_e.size < 8 or qry_e.size < 8:
+        return times, lags, empty
+    ref_thr = max(0.012, 0.08 * float(np.percentile(ref_e, 90)))
+    qry_thr = max(0.012, 0.08 * float(np.percentile(qry_e, 90)))
+    pins: list[float] = []
+    for g0, g1 in _silence_runs(ref_e, hop, ref_thr, 0.30):
+        if g1 - g0 > 2.0 or g0 < 1.0:
+            continue
+        gap_level = ref_e[int(g0 / hop) : int(g1 / hop)]
+        if gap_level.size == 0 or float(np.median(gap_level)) > 0.004:
+            continue
+        lag1 = float(np.interp(g1, times, lags))
+        q1 = g1 - lag1
+        iq1 = int(round(q1 / hop))
+        if iq1 <= 1 or iq1 >= len(qry_e):
+            continue
+        iq = iq1 - 1
+        while iq > 0 and qry_e[iq] < qry_thr:
+            iq -= 1
+        qs = (iq + 1) * hop
+        if q1 - qs < 0.12 or q1 - qs > 1.5:
+            continue
+        # The attack just after the gap has to be the same hit.
+        win = max(4, int(round(0.30 / hop)))
+        a0 = int(round(g1 / hop))
+        b0 = int(round(q1 / hop))
+        if a0 + win >= len(ref_e) or b0 < 0 or b0 + win >= len(qry_e):
+            continue
+        block = ref_e[a0 : a0 + win].astype(np.float64)
+        other = qry_e[b0 : b0 + win].astype(np.float64)
+        block -= float(block.mean())
+        other -= float(other.mean())
+        den = float(np.linalg.norm(block) * np.linalg.norm(other))
+        if den < 1e-8 or float(np.dot(block, other) / den) < 0.35:
+            continue
+        placed = _dst_for_source(times, lags, qs)
+        late = placed - g0
+        if late < 0.10 or late > 0.60:
+            continue
+        desired = g0 - qs
+        anchor = max(float(times[0]), g0 - 3.5)
+        lag_anchor = float(np.interp(anchor, times, lags))
+        original = lags.copy()
+        original_t = times.copy()
+        times, lags = _put_lag(times, lags, g0, desired)
+        times, lags = _put_lag(times, lags, g1, lag1)
+        for i, t in enumerate(times):
+            t = float(t)
+            if t <= anchor or t >= g1 - 1e-3:
+                continue
+            if abs(t - g0) <= 0.03 or abs(t - g1) <= 0.03:
+                continue
+            if t < g0:
+                frac = (t - anchor) / max(g0 - anchor, 1e-3)
+                lags[i] = lag_anchor + frac * (desired - lag_anchor)
+            else:
+                frac = (t - g0) / max(g1 - g0, 1e-3)
+                lags[i] = desired + frac * (lag1 - desired)
+        # Keep samples outside the phrase on the lag they already had.
+        for i, t in enumerate(original_t):
+            if float(t) <= anchor or float(t) >= g1:
+                j = int(np.argmin(np.abs(times - t)))
+                if abs(float(times[j]) - float(t)) <= 0.03:
+                    lags[j] = float(original[i])
+        pins.extend((float(g0), float(g1)))
+    return times, _monotonic_lag(times, lags), pins
+
+
 def solve_time_map(
     evidence: AlignmentEvidence,
     report: AlignmentReport,
@@ -445,6 +835,9 @@ def solve_time_map(
     target_sec: float,
     in_sec: float,
     beat_weight: float | None = None,
+    envelope_ref: np.ndarray | None = None,
+    envelope_qry: np.ndarray | None = None,
+    envelope_sr: int = 0,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Return times, mapped lags (full, including offset), padded src, dst.
 
@@ -452,7 +845,7 @@ def solve_time_map(
     ``map_stem`` subtracts ``pad_sec`` so the stored map is in original-stem
     time. The returned lags are the ones to draw.
     """
-    times = evidence.times
+    times = np.asarray(evidence.times, dtype=float).copy()
     if len(times) < 2:
         src = np.array([0.0, max(in_sec, 0.0)])
         dst = np.array([0.0, max(target_sec, 0.0)])
@@ -493,7 +886,29 @@ def solve_time_map(
         rate_stats=rate_stats,
     )
     mapped = _monotonic_lag(times, mapped)
+    mapped = refine_lags_with_envelope(
+        envelope_ref,
+        envelope_qry,
+        envelope_sr,
+        times,
+        mapped,
+    )
+    mapped = pull_unmatched_phrase(
+        envelope_ref,
+        envelope_qry,
+        envelope_sr,
+        times,
+        mapped,
+    )
+    times, mapped, gap_pins = fit_reference_gaps(
+        envelope_ref,
+        envelope_qry,
+        envelope_sr,
+        times,
+        mapped,
+    )
     jump_times = [j.time if hasattr(j, "time") else float(j["time"]) for j in report.jumps]
+    jump_times.extend(gap_pins)
     src, dst = src_dst_from_lags(
         times,
         mapped - report.offset_sec,
@@ -508,7 +923,7 @@ def solve_time_map(
     report.times = [float(v) for v in times]
     report.lags = [float(v) for v in mapped]
     report.confidence_series = [float(v) for v in evidence.scores]
-    report.low_conf_spans = spans_where(times, labels, "low")
+    report.low_conf_spans = spans_where(np.asarray(evidence.times, dtype=float), labels, "low")
     report.markers = [float(v) for v in dst]
     report.profile = profile.name
     report.rate_limit = {

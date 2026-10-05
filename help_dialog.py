@@ -572,11 +572,12 @@ def show_align_help(parent: QWidget) -> None:
                     "Silences cut between vocal phrases is on for acapellas that had the rests removed. "
                     "Turn it off when the vocal still has its original rests: phrase placement is skipped and the vocal follows the instrumental. "
                     "Tag folder _[pass] / _[fail] renames each song in place after the check. "
-                    "The Aca and Inst columns are the acapella against the Demucs vocal and the instrumental against the Demucs instrumental. "
+                    "The Aca and Inst columns are the acapella against the Mel-Band vocal and the instrumental against the Mel-Band instrumental. "
                     "The folder is tagged fail when either stem fails. "
                     "P and F in the player rename that song folder; those two columns stay the measured checks. "
                     "The bottom bar then shows how many are marked fail, and accuracy is the rest. "
                     "Select a row to open the lag map. The legend names the vocal, the instrumental, the yellow drift line, jumps, warp markers, restored gaps, and beats. "
+                    "Use the Lag map chevron to collapse it when you want more room in the results list. "
                     "The thresholds under Options set how strict the final “pass” check is — "
                     "tighter values mean fewer false wins; looser values forgive harder material. "
                     "Maximum front pad covers songs that start much later than the original.",

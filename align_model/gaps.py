@@ -221,6 +221,41 @@ def _stretch_channel(chunk: np.ndarray, n_out: int, sr: int, engine: str) -> np.
     return _fit_length(stretched, n_out)
 
 
+# Phrases inside this band are paste/rubberband. Only larger warps pay for élastique.
+_REAPER_RATE_SLACK = 0.02
+_REAPER_MIN_DELTA_SEC = 0.02
+
+
+def _needs_elastique(n_in: int, n_out: int, sr: int) -> bool:
+    """True when the phrase length change is large enough to justify REAPER."""
+    if n_in <= 0 or n_out <= 0:
+        return False
+    if abs(n_in - n_out) <= max(2, int(round(_REAPER_MIN_DELTA_SEC * max(sr, 1)))):
+        return False
+    return abs((n_in / n_out) - 1.0) > _REAPER_RATE_SLACK
+
+
+def _stretch_piece(
+    chunk: np.ndarray,
+    n_out: int,
+    sr: int,
+    *,
+    engine: str,
+) -> np.ndarray:
+    channels = 1 if chunk.ndim == 1 else chunk.shape[1]
+    if chunk.ndim == 1:
+        chunk = chunk[:, None]
+    columns = [
+        _stretch_channel(chunk[:, c] if chunk.size else np.zeros(0), n_out, sr, engine)
+        for c in range(channels)
+    ]
+    return (
+        np.stack(columns, axis=1)
+        if columns
+        else np.zeros((n_out, channels), dtype=np.float32)
+    )
+
+
 def _reaper_stretch_many(
     chunks: list[np.ndarray],
     n_outs: list[int],
@@ -235,6 +270,8 @@ def _reaper_stretch_many(
 
     from warp_align_reaper import run_reaper_jobs
 
+    if not chunks:
+        return []
     rendered: list[np.ndarray] = []
     with tempfile.TemporaryDirectory(prefix="gap_phrase_") as tmp:
         tmp_path = Path(tmp)
@@ -276,6 +313,73 @@ def _reaper_stretch_many(
     return rendered
 
 
+def trim_span_to_file(span: MapSpan, src_duration: float) -> MapSpan | None:
+    """Drop the part of a span that addresses samples the file does not have.
+
+    A map can open before source time 0. Clipping that read and still
+    stretching the rest across the whole destination starts the phrase
+    early (Groove Thang: Demucs at 2.741 s, output at 2.636 s). The missing
+    pre-roll stays silence, and the audio that does exist keeps its time.
+    """
+    src0 = float(span.src_start)
+    src1 = float(span.src_end)
+    dst0 = float(span.dst_start)
+    dst1 = float(span.dst_end)
+    width = src1 - src0
+    if width <= 1e-6:
+        return None
+    limit = max(0.0, float(src_duration))
+    new_src0 = min(max(src0, 0.0), limit)
+    new_src1 = min(max(src1, 0.0), limit)
+    if new_src1 - new_src0 < 0.02:
+        return None
+    rate = (dst1 - dst0) / width
+    new_dst0 = dst0 + (new_src0 - src0) * rate
+    new_dst1 = dst0 + (new_src1 - src0) * rate
+    if new_dst1 - new_dst0 < 0.02:
+        return None
+    return MapSpan(span.kind, new_src0, new_src1, new_dst0, new_dst1)
+
+
+def _with_source_tails(
+    speech: list[MapSpan],
+    src_duration: float,
+    dst_duration: float,
+) -> list[MapSpan]:
+    """Keep the source audio the silence gate left between phrases.
+
+    A speech span ends on the first quiet hop. The decay after that hop is
+    still in the file, and replacing it with the destination stall is what
+    cuts the end of the section. The extra stall, past that source audio,
+    stays silence.
+    """
+    ordered = sorted(speech, key=lambda span: (span.dst_start, span.src_start))
+    attached: list[MapSpan] = []
+    for i, span in enumerate(ordered):
+        if i + 1 < len(ordered):
+            src_limit = float(ordered[i + 1].src_start)
+            dst_limit = float(ordered[i + 1].dst_start)
+        else:
+            src_limit = float(src_duration)
+            dst_limit = float(dst_duration)
+        bridge = src_limit - float(span.src_end)
+        room = dst_limit - float(span.dst_end)
+        keep = min(max(0.0, bridge), max(0.0, room))
+        if keep <= 1e-3:
+            attached.append(span)
+            continue
+        attached.append(
+            MapSpan(
+                "speech",
+                float(span.src_start),
+                float(span.src_end) + keep,
+                float(span.dst_start),
+                float(span.dst_end) + keep,
+            )
+        )
+    return attached
+
+
 def render_gap_aware(
     y: np.ndarray,
     sr: int,
@@ -292,46 +396,67 @@ def render_gap_aware(
         audio = audio[:, None]
     channels = audio.shape[1]
     out = np.zeros((max(1, int(target_frames)), channels), dtype=np.float32)
-    speech = [span for span in spans if span.kind == "speech"]
-    reaper_chunks = None
-    if engine == "reaper" and reaper_exe is not None and speech:
-        pieces = []
-        n_outs = []
-        for span in speech:
-            s0 = int(np.clip(round(span.src_start * sr), 0, len(audio)))
-            s1 = int(np.clip(round(span.src_end * sr), s0, len(audio)))
-            n_out = max(1, int(round((span.dst_end - span.dst_start) * sr)))
-            pieces.append(audio[s0:s1] if s1 > s0 else np.zeros((1, channels), dtype=np.float32))
-            n_outs.append(n_out)
-        try:
-            reaper_chunks = _reaper_stretch_many(pieces, n_outs, sr, reaper_exe)
-        except Exception as exc:
-            reaper_chunks = None
-            if notes is not None:
-                notes.append(f"phrase_stretch=rubberband:{type(exc).__name__}")
-    elif engine == "reaper" and notes is not None and speech:
-        notes.append("phrase_stretch=rubberband")
-    fade = max(1, int(0.008 * sr))
-    speech_i = 0
+    src_duration = len(audio) / float(sr) if sr else 0.0
+    dst_duration = len(out) / float(sr) if sr else 0.0
+    speech = []
     for span in spans:
         if span.kind != "speech":
             continue
-        i0 = int(round(span.dst_start * sr))
+        trimmed = trim_span_to_file(span, src_duration)
+        if trimmed is not None:
+            speech.append(trimmed)
+    speech = _with_source_tails(speech, src_duration, dst_duration)
+    pieces: list[np.ndarray] = []
+    n_outs: list[int] = []
+    for span in speech:
+        s0 = int(np.clip(round(span.src_start * sr), 0, len(audio)))
+        s1 = int(np.clip(round(span.src_end * sr), s0, len(audio)))
         n_out = max(1, int(round((span.dst_end - span.dst_start) * sr)))
-        if reaper_chunks is not None:
-            stretched = reaper_chunks[speech_i]
-            speech_i += 1
-        else:
-            s0 = int(np.clip(round(span.src_start * sr), 0, len(audio)))
-            s1 = int(np.clip(round(span.src_end * sr), s0, len(audio)))
-            chunk = audio[s0:s1]
-            columns = [
-                _stretch_channel(chunk[:, c] if chunk.size else np.zeros(0), n_out, sr, engine)
-                for c in range(channels)
-            ]
-            stretched = np.stack(columns, axis=1) if columns else np.zeros((n_out, channels), dtype=np.float32)
+        pieces.append(audio[s0:s1] if s1 > s0 else np.zeros((1, channels), dtype=np.float32))
+        n_outs.append(n_out)
+
+    stretched_list: list[np.ndarray | None] = [None] * len(speech)
+    light_engine = "rubberband" if engine == "reaper" else engine
+    if engine == "reaper" and reaper_exe is not None and speech:
+        heavy_i = [
+            i
+            for i, (piece, n_out) in enumerate(zip(pieces, n_outs))
+            if _needs_elastique(len(piece), n_out, sr)
+        ]
+        light_n = len(speech) - len(heavy_i)
+        if heavy_i:
+            try:
+                heavy = _reaper_stretch_many(
+                    [pieces[i] for i in heavy_i],
+                    [n_outs[i] for i in heavy_i],
+                    sr,
+                    reaper_exe,
+                )
+                for slot, chunk in zip(heavy_i, heavy):
+                    stretched_list[slot] = chunk
+                if notes is not None:
+                    notes.append(f"phrase_stretch=reaper:{len(heavy_i)}+{light_engine}:{light_n}")
+            except Exception as exc:
+                if notes is not None:
+                    notes.append(f"phrase_stretch={light_engine}:{type(exc).__name__}")
+        elif notes is not None:
+            notes.append(f"phrase_stretch={light_engine}:{light_n}")
+    elif engine == "reaper" and notes is not None and speech:
+        notes.append(f"phrase_stretch={light_engine}:{len(speech)}")
+
+    for i, (piece, n_out) in enumerate(zip(pieces, n_outs)):
+        if stretched_list[i] is None:
+            stretched_list[i] = _stretch_piece(piece, n_out, sr, engine=light_engine)
+
+    fade = max(1, int(0.008 * sr))
+    for span, stretched, n_out in zip(speech, stretched_list, n_outs):
+        assert stretched is not None
+        i0 = int(round(span.dst_start * sr))
         if stretched.shape[0] != n_out:
-            stretched = np.stack([_fit_length(stretched[:, c], n_out) for c in range(stretched.shape[1])], axis=1)
+            stretched = np.stack(
+                [_fit_length(stretched[:, c], n_out) for c in range(stretched.shape[1])],
+                axis=1,
+            )
         if stretched.shape[1] != channels:
             if stretched.shape[1] < channels:
                 stretched = np.pad(stretched, ((0, 0), (0, channels - stretched.shape[1])))
@@ -345,12 +470,9 @@ def render_gap_aware(
         j0 = max(0, i0)
         j1 = min(len(out), i0 + n_out)
         if j1 <= j0:
-            speech_i += 0
             continue
         a0 = j0 - i0
         out[j0:j1] = stretched[a0 : a0 + (j1 - j0)]
-        if reaper_chunks is None:
-            speech_i += 1
     return out
 
 

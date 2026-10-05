@@ -37,6 +37,7 @@ from check_alignment import (
     DEFAULT_WEAK_WINDOW_FRAC,
     DEFAULT_WINDOW_CORR_MIN,
     analyze_alignment,
+    apply_full_score,
     apply_stem_check,
     scan_folder,
 )
@@ -1040,37 +1041,9 @@ def _align_folder_model(
         result.verdict = "error"
         result.notes += f"; post_scan:{scan_notes}"
         return
-    from align_model.quality import post_render_validation
+    from align_model.quality import stamp_result
 
-    checked = post_render_validation(
-        aca,
-        inst,
-        orig2,
-        corr_min=corr_min,
-        drift_ms=drift_ms,
-        window_corr_min=window_corr_min,
-        weak_window_frac=weak_window_frac,
-    )
-    mix_verdict, corr, lag, drift, notes = (
-        checked["verdict"],
-        checked["corr"],
-        checked["lag_sec"],
-        checked["drift_ms"],
-        checked["notes"],
-    )
-    if isinstance(result.alignment_report, dict):
-        result.alignment_report["validation"] = "post_render"
-        result.alignment_report["post_render"] = {
-            "verdict": mix_verdict,
-            "corr": corr,
-            "lag_sec": lag,
-            "drift_ms": drift,
-        }
-    result.corr = corr
-    result.lag_sec = lag
-    result.drift_ms = drift
-    result.notes += f"; {notes}"
-    apply_stem_check(
+    mix = apply_full_score(
         result,
         aca,
         inst,
@@ -1081,6 +1054,20 @@ def _align_folder_model(
         window_corr_min=window_corr_min,
         weak_window_frac=weak_window_frac,
     )
+    mix_verdict, corr, lag, drift = (
+        mix["verdict"],
+        mix["corr"],
+        mix["lag_sec"],
+        mix["drift_ms"],
+    )
+    if isinstance(result.alignment_report, dict):
+        result.alignment_report["validation"] = "post_render"
+        result.alignment_report["post_render"] = {
+            "verdict": mix_verdict,
+            "corr": corr,
+            "lag_sec": lag,
+            "drift_ms": drift,
+        }
     stamp_result(result, mix_verdict=mix_verdict, mix_corr=corr, mix_lag=lag, mix_drift=drift)
     if move_on_pass and result.verdict in ("pass", "fail"):
         _emit_step(on_step, "tag")
@@ -1268,20 +1255,7 @@ def warp_align_folder(
             result.notes += f'; post_scan:{scan_notes}'
             return result
 
-        _verdict, corr, lag, drift, _weak, notes = analyze_alignment(
-            aca,
-            inst,
-            orig2,
-            corr_min=corr_min,
-            drift_ms=drift_ms,
-            window_corr_min=window_corr_min,
-            weak_window_frac=weak_window_frac,
-        )
-        result.corr = corr
-        result.lag_sec = lag
-        result.drift_ms = drift
-        result.notes += f'; {notes}'
-        apply_stem_check(
+        apply_full_score(
             result,
             aca,
             inst,
